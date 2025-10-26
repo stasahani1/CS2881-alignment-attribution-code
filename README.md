@@ -2,7 +2,23 @@
 
 This repository provides an original implementation of [*Assessing the Brittleness of Safety Alignment via Pruning and Low-Rank Modifications*](https://arxiv.org/abs/2402.05162) by Boyi Wei*, Kaixuan Huang*, Yangsibo Huang*, Tinghao Xie, Xiangyu Qi, Mengzhou Xia, Prateek Mittal, Mengdi Wang and Peter Henderson.
 
+
 ## 1. Setup
+
+(update) With UV you can do the following:
+uv venv --python 3.9 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+gdown 1zugbLyGZKsH1L19L9biHLfaGGFnEc7XL
+unzip -q lm-evaluation-harness.zip
+pip install -e lm-evaluation-harness/
+pip uninstall lm_eval -y && cd lm-evaluation-harness && pip install -e .)
+
+uv run python download_hf_models.py --model_name meta-llama/Llama-2-7b-chat-hf --local_dir models/llama-2-7b-chat-hf
+
+Edit main.py to replace with the name of the model
+
+
 
 You can use the following instruction to create conda environment
 ```bash

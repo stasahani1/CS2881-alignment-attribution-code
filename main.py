@@ -29,10 +29,10 @@ print("transformers", version("transformers"))
 print("accelerate", version("accelerate"))
 print("# of gpus: ", torch.cuda.device_count())
 
-SAVE_PATH = "temp"
+SAVE_PATH = "/dev/shm/pruned_models"  # Use shared memory to avoid /workspace quota
 
 modeltype2path = {
-    "llama2-7b-chat-hf": "",
+    "llama2-7b-chat-hf": "models/llama-2-7b-chat-hf/",
     "llama2-13b-chat-hf": "",
     "llama2-7b-hf": "",
     "llama2-13b-hf": "",
@@ -436,6 +436,7 @@ def main():
             SAVE_PATH,
             f"{args.prune_method}_usediff_{args.use_diff}_recover_{args.recover_from_base}",
         )
+        os.makedirs(SAVE_PATH, exist_ok=True)  # Ensure directory exists
         model.save_pretrained(pruned_path)
         vllm_model = LLM(
             model=pruned_path,
@@ -560,6 +561,11 @@ def main():
                     flush=True,
                 )
         del vllm_model
+        # Clean up the saved pruned model to free disk space
+        import shutil
+        if os.path.exists(pruned_path):
+            shutil.rmtree(pruned_path)
+            print(f"Cleaned up temporary model at {pruned_path}")
 
     if args.eval_zero_shot:
         accelerate = False

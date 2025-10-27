@@ -32,7 +32,7 @@ print("# of gpus: ", torch.cuda.device_count())
 SAVE_PATH = "/dev/shm/pruned_models"  # Use shared memory to avoid /workspace quota
 
 modeltype2path = {
-    "llama2-7b-chat-hf": "models/llama-2-7b-chat-hf/",
+    "llama2-7b-chat-hf": os.path.abspath("models/llama-2-7b-chat-hf/"),
     "llama2-13b-chat-hf": "",
     "llama2-7b-hf": "",
     "llama2-13b-hf": "",

@@ -250,7 +250,7 @@ def prune_wandg(
 ):
     model = make_Act(model, verbose=False)
 
-    print(f"loading calibdation data {prune_data}")
+    print(f"loading calibration data {prune_data}")
     assert prune_data in [
         "wikitext",
         "alpaca",

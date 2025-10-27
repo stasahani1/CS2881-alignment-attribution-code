@@ -1,5 +1,5 @@
 # Code adapted from https://github.com/IST-DASLab/sparsegpt/blob/master/datautils.py
-
+import os 
 import numpy as np
 import random
 import torch
@@ -20,12 +20,23 @@ class TokenizerWrapper:
 
 # Load and process aligned dataset
 def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base"):
+    # Get the directory where this file is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(script_dir)  # Go up one level from lib/ to project root
+    
     # Load train and test datasets
     if mode == "short":
-        data_files = {"train": "./data/SFT_aligned_llama2-7b-chat-hf_train_short.csv"}
+        data_files = {"train": os.path.join(project_dir, "data", "SFT_aligned_llama2-7b-chat-hf_train_short.csv")}
     else:
-        data_files = {"train": "./data/SFT_aligned_llama2-7b-chat-hf_train.csv"}
-    traindata = load_dataset("csv", data_files=data_files, split="train")
+        data_files = {"train": os.path.join(project_dir, "data", "SFT_aligned_llama2-7b-chat-hf_train.csv")}
+    
+    try:
+        traindata = load_dataset("csv", data_files=data_files, split="train")
+        print(f"Successfully loaded dataset with {len(traindata)} examples")
+    except Exception as e:
+        print(f"Error loading align dataset: {e}")
+        return None, None
+
     trainloader = []
     random.seed(seed)
     if disentangle:

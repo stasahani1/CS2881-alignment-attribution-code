@@ -10,10 +10,10 @@ This repository provides an original implementation of [*Assessing the Brittlene
 uv venv --python 3.9 .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
-gdown 1zugbLyGZKsH1L19L9biHLfaGGFnEc7XL
-unzip -q lm-evaluation-harness.zip
-pip install -e lm-evaluation-harness/
-pip uninstall lm_eval -y && cd lm-evaluation-harness && pip install -e .
+# gdown 1zugbLyGZKsH1L19L9biHLfaGGFnEc7XL
+# unzip -q lm-evaluation-harness.zip
+# uv pip install -e lm-evaluation-harness/
+uv pip uninstall lm_eval -y && cd lm-evaluation-harness && pip install -e .
 huggingface-cli login
 uv run python download_hf_models.py --model_name meta-llama/Llama-2-7b-chat-hf --local_dir models/llama-2-7b-chat-hf
 ```

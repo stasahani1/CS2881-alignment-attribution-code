@@ -25,8 +25,8 @@ from main import modeltype2path, get_llm
 # Import with error handling for optional dependencies
 try:
     from lib.eval import eval_ppl, eval_zero_shot, eval_attack
-    from lib.prune import check_sparsity, prune_wanda, get_mask
-    from lib.model_wrapper import prune_wandg, make_Act, revert_Act_to_Linear, ActLinear
+    from lib.prune import check_sparsity, prune_wanda, get_mask, find_layers
+    from lib.model_wrapper import prune_wandg, make_Act, revert_Act_to_Linear, ActLinear, no_act_recording
     from lib.data import get_loaders
     LIB_AVAILABLE = True
 except ImportError as e:
@@ -53,7 +53,8 @@ class SafetyNeuronAnalyzer:
                                       nsamples: int = 128,
                                       seed: int = 0) -> Dict[str, torch.Tensor]:
         """
-        Identify safety-critical neurons using SNIP/Wanda scores on safety dataset.
+        Identify safety-critical neurons using SNIP/Wanda scores WITHOUT pruning.
+        This approach calculates importance scores and selects top-k% without modifying the model.
         
         Args:
             prune_method: Method to use ("wandg" for SNIP, "wanda" for Wanda)
@@ -68,50 +69,92 @@ class SafetyNeuronAnalyzer:
         if not LIB_AVAILABLE:
             raise ImportError("Required lib modules not available. Please install all dependencies.")
         
-        print(f"Identifying safety-critical neurons using {prune_method} on {prune_data} dataset...")
+        print(f"Calculating {prune_method} scores on {prune_data} dataset...")
         
-        # Create a copy of the model for analysis
-        analysis_model = copy.deepcopy(self.model)
-        analysis_model.eval()
+        # Convert model to ActLinear for score calculation (non-destructive)
+        model = make_Act(self.model, verbose=False)
         
-        # Create args object for pruning functions
-        class Args:
-            def __init__(self):
-                self.prune_method = prune_method
-                self.prune_data = prune_data
-                self.sparsity_ratio = sparsity_ratio
-                self.nsamples = nsamples
-                self.seed = seed
-                self.disentangle = True
-                self.dump_wanda_score = False
-                self.use_diff = False
-                self.recover_from_base = False
-                self.prune_part = False
-                self.neg_prune = False
-                self.use_variant = False  
-                self.prune_n = 0  
-                self.prune_m = 0  
+        # Load calibration data
+        dataloader, _ = get_loaders(
+            prune_data,
+            nsamples=nsamples,
+            seed=seed,
+            seqlen=model.seqlen,
+            tokenizer=self.tokenizer,
+            disentangle=True
+        )
+        print("Dataset loading complete")
         
-        args = Args()
+        safety_masks = {}
         
-        # Store original weights before analysis
-        self._store_original_weights(analysis_model)
+        # Process each layer to calculate importance scores
+        num_hidden_layers = model.config.num_hidden_layers
+        for layer in range(num_hidden_layers):
+            layer_filter_fn = lambda x: f"layers.{layer}." in x
+            
+            print(f"Processing layer {layer}...")
+            
+            # Enable gradients for this layer only
+            model.zero_grad()
+            model.requires_grad_(False)
+            for name, module in model.named_modules():
+                if layer_filter_fn(name) and isinstance(module, ActLinear):
+                    print(f"enabling grad for {name}")
+                    module.base.requires_grad_(True)
+                    module.base.zero_grad()
+            
+            # Calculate gradients (importance scores)
+            for batch in dataloader:
+                inp, tar = batch[0].to(self.device), batch[1].to(self.device)
+                model.zero_grad()
+                with no_act_recording(model):
+                    loss = model(input_ids=inp, labels=tar)[0]
+                loss.backward()
+            
+            # Extract scores and create masks for this layer
+            for name, module in model.named_modules():
+                if layer_filter_fn(name) and isinstance(module, ActLinear):
+                    if prune_method == "wandg":
+                        # SNIP: Use gradient magnitude as importance score
+                        scores = torch.abs(module.base.weight.grad)
+                    elif prune_method == "wanda":
+                        # Wanda: Use |weight| * sqrt(activation_norm)
+                        scores = torch.abs(module.base.weight.data) * torch.sqrt(
+                            module.activation_norms.reshape((1, -1))
+                        )
+                    else:
+                        raise ValueError(f"Unsupported prune method: {prune_method}")
+                    
+                    # Select top-k% as safety-critical neurons
+                    flat_scores = scores.flatten()
+                    num_to_select = int(flat_scores.numel() * sparsity_ratio)
+                    
+                    if num_to_select > 0:
+                        # Get threshold for top-k%
+                        threshold_idx = flat_scores.numel() - num_to_select
+                        threshold = torch.topk(flat_scores, threshold_idx, largest=False)[0][-1]
+                        
+                        # Create mask for safety-critical neurons (top-k%)
+                        mask = scores >= threshold
+                    else:
+                        # If sparsity_ratio is 0, no neurons are safety-critical
+                        mask = torch.zeros_like(scores, dtype=torch.bool)
+                    
+                    safety_masks[name] = mask
         
-        # Apply pruning to identify safety-critical neurons
-        if prune_method == "wandg":
-            prune_wandg(args, analysis_model, self.tokenizer, device=self.device, prune_data=args.prune_data)
-        elif prune_method == "wanda":
-            prune_wanda(args, analysis_model, self.tokenizer, device=self.device, prune_data=args.prune_data)
-        else:
-            raise ValueError(f"Unsupported prune method: {prune_method}")
-        
-        # Extract masks of safety-critical neurons
-        safety_masks = self._extract_safety_masks(analysis_model)
+        # Convert back to regular model (non-destructive)
+        model = revert_Act_to_Linear(model)
         
         print(f"Identified safety-critical neurons in {len(safety_masks)} layers")
         total_critical = sum(mask.sum().item() for mask in safety_masks.values())
         total_neurons = sum(mask.numel() for mask in safety_masks.values())
         print(f"Total safety-critical neurons: {total_critical}/{total_neurons} ({100*total_critical/total_neurons:.2f}%)")
+        
+        # Use existing check_sparsity function for additional analysis
+        if LIB_AVAILABLE:
+            print("Checking model sparsity...")
+            sparsity = check_sparsity(self.model)
+            print(f"Overall model sparsity: {sparsity:.4f}")
         
         self.safety_critical_neurons = safety_masks
         return safety_masks
@@ -131,8 +174,10 @@ class SafetyNeuronAnalyzer:
         frozen_count = 0
         total_count = 0
         
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear) and name in self.safety_critical_neurons:
+        # Use existing find_layers function for consistency
+        linear_layers = find_layers(model)
+        for name, module in linear_layers.items():
+            if name in self.safety_critical_neurons:
                 mask = self.safety_critical_neurons[name]
                 
                 # Create a hook to zero out gradients for safety-critical neurons
@@ -153,28 +198,6 @@ class SafetyNeuronAnalyzer:
         print(f"Frozen {frozen_count}/{total_count} safety-critical neurons ({100*frozen_count/total_count:.2f}%)")
         return model
     
-    def _store_original_weights(self, model: nn.Module):
-        """Store original weights before analysis."""
-        self.original_weights = {}
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                self.original_weights[name] = module.weight.data.clone()
-    
-    def _extract_safety_masks(self, pruned_model: nn.Module) -> Dict[str, torch.Tensor]:
-        """Extract masks indicating which neurons were pruned (safety-critical)."""
-        masks = {}
-        
-        for name, module in pruned_model.named_modules():
-            if isinstance(module, nn.Linear) and name in self.original_weights:
-                # Compare original and pruned weights to identify safety-critical neurons
-                original_weight = self.original_weights[name]
-                pruned_weight = module.weight.data
-                
-                # Safety-critical neurons are those that were pruned (set to zero)
-                mask = torch.abs(pruned_weight) < 1e-8
-                masks[name] = mask
-        
-        return masks
 
 
 class FineTuner:
@@ -279,57 +302,6 @@ class FineTuner:
         return self.model
 
 
-def recalculate_safety_scores(model, 
-                           tokenizer, 
-                           analyzer: SafetyNeuronAnalyzer,
-                           prune_method: str = "wandg",
-                           prune_data: str = "align",
-                           sparsity_ratio: float = 0.1) -> Dict[str, torch.Tensor]:
-    """
-    Recalculate SNIP/Wanda scores on the fine-tuned model to identify new safety-critical neurons.
-    
-    Args:
-        model: The fine-tuned model
-        tokenizer: Tokenizer for the model
-        analyzer: SafetyNeuronAnalyzer instance
-        prune_method: Method to use for scoring
-        prune_data: Dataset to use for safety evaluation
-        sparsity_ratio: Fraction of neurons to identify as safety-critical
-        
-    Returns:
-        Dictionary mapping layer names to boolean masks indicating new safety-critical neurons
-    """
-    print("Recalculating safety-critical neuron scores on fine-tuned model...")
-    
-    # Create a fresh analyzer for the fine-tuned model
-    new_analyzer = SafetyNeuronAnalyzer(model, tokenizer)
-    
-    # Identify safety-critical neurons in the fine-tuned model
-    new_safety_masks = new_analyzer.identify_safety_critical_neurons(
-        prune_method=prune_method,
-        prune_data=prune_data,
-        sparsity_ratio=sparsity_ratio
-    )
-    
-    # Compare with original safety-critical neurons
-    if analyzer.safety_critical_neurons:
-        print("\nComparing safety-critical neurons before and after fine-tuning:")
-        for layer_name in new_safety_masks:
-            if layer_name in analyzer.safety_critical_neurons:
-                original_mask = analyzer.safety_critical_neurons[layer_name]
-                new_mask = new_safety_masks[layer_name]
-                
-                # Calculate overlap
-                overlap = (original_mask & new_mask).sum().item()
-                original_count = original_mask.sum().item()
-                new_count = new_mask.sum().item()
-                
-                print(f"Layer {layer_name}:")
-                print(f"  Original safety-critical: {original_count}")
-                print(f"  New safety-critical: {new_count}")
-                print(f"  Overlap: {overlap} ({100*overlap/max(original_count, new_count, 1):.1f}%)")
-    
-    return new_safety_masks
 
 
 def main():
@@ -366,6 +338,11 @@ def main():
     parser.add_argument('--results_path', type=str, default='./results', 
                        help='Path to save analysis results')
     
+    # Evaluation arguments (following main.py pattern)
+    parser.add_argument('--eval_ppl', action='store_true', help='Evaluate perplexity')
+    parser.add_argument('--eval_zero_shot', action='store_true', help='Evaluate zero-shot performance')
+    parser.add_argument('--eval_attack', action='store_true', help='Evaluate attack success rate')
+    
     # Other arguments
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use')
@@ -379,13 +356,23 @@ def main():
     # Set device
     device = torch.device(args.device)
     
+    # Memory management: Enable memory efficient attention and other optimizations
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
     # Load model and tokenizer
     print(f"Loading model {args.model}...")
+    print(f"GPU memory before loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "CPU mode")
+    
     model = get_llm(args.model, args.cache_dir)
     tokenizer = AutoTokenizer.from_pretrained(modeltype2path[args.model], use_fast=False)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    
+    print(f"GPU memory after loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Model loaded")
     
     # Step 1: Identify safety-critical neurons
     print("\n" + "="*50)
@@ -400,6 +387,10 @@ def main():
         nsamples=args.nsamples,
         seed=args.seed
     )
+    
+    # Clear memory after Step 1
+    torch.cuda.empty_cache()
+    print(f"GPU memory after Step 1: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Step 1 complete")
     
     # Step 2: Freeze safety-critical neurons and fine-tune
     print("\n" + "="*50)
@@ -420,19 +411,90 @@ def main():
         save_path=args.save_path
     )
     
+    # Clear memory after Step 2
+    torch.cuda.empty_cache()
+    print(f"GPU memory after Step 2: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Step 2 complete")
+    
     # Step 3: Recalculate safety-critical neuron scores
     print("\n" + "="*50)
     print("STEP 3: Recalculating safety-critical neuron scores")
     print("="*50)
     
-    new_safety_masks = recalculate_safety_scores(
-        fine_tuned_model,
-        tokenizer,
-        analyzer,
+    # Store original safety masks before updating analyzer
+    original_masks = analyzer.safety_critical_neurons.copy()
+    
+    # Update analyzer to use the fine-tuned model
+    analyzer.model = fine_tuned_model
+    
+    # Reuse the same method to identify safety-critical neurons on fine-tuned model
+    new_safety_masks = analyzer.identify_safety_critical_neurons(
         prune_method=args.prune_method,
         prune_data=args.prune_data,
-        sparsity_ratio=args.sparsity_ratio
+        sparsity_ratio=args.sparsity_ratio,
+        nsamples=args.nsamples,
+        seed=args.seed
     )
+    
+    # Compare with original safety-critical neurons
+    print("\nComparing safety-critical neurons before and after fine-tuning:")
+    for layer_name in new_safety_masks:
+        if layer_name in original_masks:
+            original_mask = original_masks[layer_name]
+            new_mask = new_safety_masks[layer_name]
+            
+            # Calculate overlap
+            overlap = (original_mask & new_mask).sum().item()
+            original_count = original_mask.sum().item()
+            new_count = new_mask.sum().item()
+            
+            print(f"Layer {layer_name}:")
+            print(f"  Original safety-critical: {original_count}")
+            print(f"  New safety-critical: {new_count}")
+            print(f"  Overlap: {overlap} ({100*overlap/max(original_count, new_count, 1):.1f}%)")
+    
+    # Clear memory after Step 3
+    torch.cuda.empty_cache()
+    print(f"GPU memory after Step 3: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Step 3 complete")
+    
+    # Step 4: Evaluate models (optional, using existing eval functions)
+    evaluation_results = {}
+    if args.eval_ppl or args.eval_zero_shot or args.eval_attack:
+        print("\n" + "="*50)
+        print("STEP 4: Model Evaluation")
+        print("="*50)
+        
+        # Evaluate original model
+        print("Evaluating original model...")
+        original_results = {}
+        if args.eval_ppl:
+            original_results['ppl'] = eval_ppl(model, tokenizer, "wikitext")
+        if args.eval_zero_shot:
+            original_results['zero_shot'] = eval_zero_shot(
+                modeltype2path[args.model], model, tokenizer
+            )
+        if args.eval_attack:
+            original_results['attack'] = eval_attack(model, tokenizer)
+        
+        # Evaluate fine-tuned model
+        print("Evaluating fine-tuned model...")
+        finetuned_results = {}
+        if args.eval_ppl:
+            finetuned_results['ppl'] = eval_ppl(fine_tuned_model, tokenizer, "wikitext")
+        if args.eval_zero_shot:
+            finetuned_results['zero_shot'] = eval_zero_shot(
+                modeltype2path[args.model], fine_tuned_model, tokenizer
+            )
+        if args.eval_attack:
+            finetuned_results['attack'] = eval_attack(fine_tuned_model, tokenizer)
+        
+        evaluation_results = {
+            'original_model': original_results,
+            'fine_tuned_model': finetuned_results
+        }
+        
+        print("Evaluation results:")
+        print(f"Original model: {original_results}")
+        print(f"Fine-tuned model: {finetuned_results}")
     
     # Save results
     print("\n" + "="*50)
@@ -455,7 +517,9 @@ def main():
         'sparsity_ratio': args.sparsity_ratio,
         'training_data': args.training_data,
         'num_epochs': args.num_epochs,
-        'learning_rate': args.learning_rate
+        'learning_rate': args.learning_rate,
+        'memory_efficient': True,  # Flag indicating memory optimizations were used
+        'evaluation_results': evaluation_results
     }
     
     with open(os.path.join(args.results_path, 'analysis_summary.json'), 'w') as f:
@@ -463,6 +527,7 @@ def main():
     
     print(f"Analysis complete! Results saved to {args.results_path}")
     print(f"Fine-tuned model saved to {args.save_path}")
+    print(f"Final GPU memory usage: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Analysis complete")
 
 
 if __name__ == '__main__':

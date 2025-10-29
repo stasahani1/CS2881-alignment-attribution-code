@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Enable GPU access - override RunPod's void setting
-export CUDA_VISIBLE_DEVICES=0
-export NVIDIA_VISIBLE_DEVICES=0
+# export CUDA_VISIBLE_DEVICES=0
+# export NVIDIA_VISIBLE_DEVICES=0
 
 MODEL="llama2-7b-chat-hf"
 METHOD="wandg_set_difference"

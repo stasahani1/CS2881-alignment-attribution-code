@@ -1,327 +1,644 @@
 """
 Extension for Safety-Critical Neuron Analysis and Fine-tuning
 
-This module implements a pipeline for:
-1. Identifying safety-critical neurons using SNIP/Wanda scores
-2. Freezing these neurons and fine-tuning the model
-3. Recalculating SNIP/Wanda scores on the fine-tuned model
+This module implements experiments to understand why safety alignment is brittle:
+1. Experiment 1: Frozen-Regime Fine-Tuning (Wanda Score Dynamics)
+2. Experiment 2: Unfrozen Fine-Tuning (Safety Neuron Drift)
 
-Based on the alignment attribution research framework.
+Based on "Assessing the Brittleness of Safety Alignment via Pruning and Low-Rank Modifications"
 """
 
 import os
-import copy
 import json
 import torch
 import argparse
 import numpy as np
-import torch.nn as nn
-from datasets import Dataset
-from typing import Dict, List, Optional, Tuple
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from main import modeltype2path, get_llm
-from lib.extension_utils import SafetyNeuronAnalyzer, FineTuner
-
+from lib.extension_utils import (
+    SafetyNeuronAnalyzer,
+    FineTuner,
+    WeightDriftAnalyzer,
+    ScoreDynamicsAnalyzer,
+    capture_model_weights,
+    evaluate_model_safety
+)
 
 
 def main():
     """
-    Main pipeline for safety-critical neuron analysis and fine-tuning.
+    Main pipeline for safety-critical neuron analysis and fine-tuning experiments.
     """
-    parser = argparse.ArgumentParser(description="Safety-Critical Neuron Analysis and Fine-tuning")
+    parser = argparse.ArgumentParser(
+        description="Safety-Critical Neuron Analysis and Fine-tuning Extension"
+    )
 
     # Task arguments
-    parser.add_argument("--task", type=str, default="identify_safety_neurons", choices=["identify_safety_neurons", "fine_tune", "eval"], help="Task to perform, select value from ['identify_safety_neurons', 'fine_tune', 'eval']")
-    
+    parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        choices=[
+            "identify_safety_neurons",
+            "identify_utility_neurons",
+            "fine_tune_frozen",
+            "fine_tune_unfrozen",
+            "eval_score_dynamics",
+            "eval_weight_drift",
+        ],
+        help="Task to perform"
+    )
+
     # Model arguments
-    parser.add_argument("--model", type=str, default="llama2-7b-chat-hf", help="Model name to analyze")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Cache directory for remote models")
-    
-    # Safety neuron identification arguments
-    parser.add_argument("--prune_method", type=str, default="wandg", choices=["wandg", "wanda"], 
-                       help="Method for identifying safety-critical neurons")
-    parser.add_argument("--prune_data", type=str, default="align", 
-                       choices=["align", "align_short"], help="Dataset for safety analysis")
-    parser.add_argument("--sparsity_ratio", type=float, default=0.1, 
-                       help="Fraction of neurons to identify as safety-critical")
-    parser.add_argument("--nsamples", type=int, default=128, 
-                       help="Number of samples for safety analysis")
-    
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="llama2-7b-chat-hf",
+        help="Model name to analyze"
+    )
+    parser.add_argument(
+        "--original_model_path",
+        type=str,
+        default=None,
+        help="Path to original pre-fine-tuned model (for evaluation tasks)"
+    )
+    parser.add_argument(
+        "--fine_tuned_model_path",
+        type=str,
+        default=None,
+        help="Path to fine-tuned model (for evaluation tasks)"
+    )
+
+    # Neuron identification arguments
+    parser.add_argument(
+        "--prune_method",
+        type=str,
+        default="wanda",
+        choices=["wandg", "wanda"],
+        help="Method for identifying critical neurons"
+    )
+    parser.add_argument(
+        "--prune_data",
+        type=str,
+        default="align_short",
+        help="Dataset for neuron analysis (align/align_short for safety, alpaca_cleaned_no_safety for utility)"
+    )
+    parser.add_argument(
+        "--sparsity_ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of neurons to identify as critical"
+    )
+    parser.add_argument(
+        "--nsamples",
+        type=int,
+        default=128,
+        help="Number of samples for scoring"
+    )
+
     # Fine-tuning arguments
-    parser.add_argument("--training_data", type=str, default="alpaca_cleaned_no_safety",
-                       help="Dataset for fine-tuning")
-    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
-    parser.add_argument("--safety_masks", type=str, default=None, help="Path to safety masks")
-    
-    # Evaluation arguments 
-    parser.add_argument("--original_safety_masks_path", type=str, default=None, help="Path to original safety masks")
-    parser.add_argument("--fine_tuned_safety_masks_path", type=str, default=None, help="Path to fine-tuned safety masks")
-    parser.add_argument("--original_safety_scores_path", type=str, default=None, help="Path to original safety scores")
-    parser.add_argument("--fine_tuned_safety_scores_path", type=str, default=None, help="Path to fine-tuned safety scores")
-    
+    parser.add_argument(
+        "--safety_masks",
+        type=str,
+        default=None,
+        help="Path to safety neuron masks (.pt file)"
+    )
+    parser.add_argument(
+        "--utility_masks",
+        type=str,
+        default=None,
+        help="Path to utility neuron masks (.pt file)"
+    )
+    parser.add_argument(
+        "--training_data",
+        type=str,
+        default="alpaca_cleaned_no_safety",
+        help="Dataset for fine-tuning"
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=3,
+        help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=2e-5,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Batch size"
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length"
+    )
+
+    # Evaluation arguments
+    parser.add_argument(
+        "--original_safety_masks_path",
+        type=str,
+        default=None,
+        help="Path to original safety neuron masks"
+    )
+    parser.add_argument(
+        "--original_safety_scores_path",
+        type=str,
+        default=None,
+        help="Path to original safety neuron scores"
+    )
+    parser.add_argument(
+        "--fine_tuned_safety_scores_path",
+        type=str,
+        default=None,
+        help="Path to fine-tuned safety neuron scores"
+    )
+    parser.add_argument(
+        "--safety_masks_path",
+        type=str,
+        default=None,
+        help="Path to safety masks for drift analysis"
+    )
+    parser.add_argument(
+        "--utility_masks_path",
+        type=str,
+        default=None,
+        help="Path to utility masks for drift analysis"
+    )
+    parser.add_argument(
+        "--original_weights_path",
+        type=str,
+        default=None,
+        help="Path to pre-fine-tuning weights snapshot"
+    )
+    parser.add_argument(
+        "--eval_attack",
+        action="store_true",
+        help="Run ASR evaluation using eval_attack() from base codebase"
+    )
+
     # Output arguments
-    parser.add_argument("--model_save_path", type=str, default="./fine_tuned_model", 
-                       help="Path to save fine-tuned model")
-    parser.add_argument("--results_path", type=str, default="./results", 
-                       help="Path to save analysis results")
-    
+    parser.add_argument(
+        "--model_save_path",
+        type=str,
+        default="./fine_tuned_model",
+        help="Path to save fine-tuned model"
+    )
+    parser.add_argument(
+        "--results_path",
+        type=str,
+        default="./results",
+        help="Path to save analysis results"
+    )
+
     # Other arguments
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
-    
+
     args = parser.parse_args()
-    
+
     # Set random seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    
+
     # Set device
     device = torch.device(args.device)
-    
+
     # Memory management: Enable memory efficient attention and other optimizations
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    if args.task != "eval":
-        # Load model and tokenizer
-        print(f"Loading model {args.model}...")
-        print(f"GPU memory before loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "CPU mode")
-        
-        model = get_llm(args.model)
-        tokenizer = AutoTokenizer.from_pretrained(modeltype2path[args.model], use_fast=False)
+    # ========================================================================
+    # Task: Identify Safety-Critical Neurons
+    # ========================================================================
+    if args.task == "identify_safety_neurons":
+        print("\n" + "=" * 70)
+        print("TASK: Identify Safety-Critical Neurons")
+        print("=" * 70)
 
+        # Load model and tokenizer
+        print(f"\nLoading model {args.model}...")
+        model = get_llm(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(
+            modeltype2path[args.model], use_fast=False
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        
-        print(f"GPU memory after loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Model loaded")
-    
 
-    # Step 1: Identify safety-critical neurons
-    if args.task == "identify_safety_neurons":
-        print("\n" + "="*50)
-        print("STEP 1: Identifying safety-critical neurons")
-        print("="*50)
-        
+        # Identify safety-critical neurons
         analyzer = SafetyNeuronAnalyzer(model, tokenizer, device)
-        safety_masks, original_safety_scores = analyzer.identify_safety_critical_neurons(
+        safety_masks, safety_scores = analyzer.identify_safety_critical_neurons(
             prune_method=args.prune_method,
             prune_data=args.prune_data,
             sparsity_ratio=args.sparsity_ratio,
             nsamples=args.nsamples,
-            seed=args.seed
+            seed=args.seed,
         )
-        
-        # Clear memory after Step 1
-        torch.cuda.empty_cache()
-        print(f"GPU memory after Step 1: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Step 1 complete")
 
-        # Save safety masks and scores
-        print("\nSaving safety masks and scores...")
+        # Save results
         save_dir = os.path.join(args.results_path, "safety_neurons")
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Save masks and scores 
-        torch.save(safety_masks, os.path.join(save_dir, "original_safety_masks.pt"))
-        torch.save(original_safety_scores, os.path.join(save_dir, "original_safety_scores.pt")) 
-        
-        print(f"Saved safety neuron data to {save_dir}")
-    
 
-    # Step 2: Freeze safety-critical neurons and fine-tune
-    elif args.task == "fine_tune":
-        print("\n" + "="*50)
-        print("STEP 2: Freezing neurons and fine-tuning")
-        print("="*50)
-        
+        torch.save(safety_masks, os.path.join(save_dir, "original_safety_masks.pt"))
+        torch.save(safety_scores, os.path.join(save_dir, "original_safety_scores.pt"))
+
+        print(f"\nSaved safety neuron data to {save_dir}")
+
+        # Clear memory
+        torch.cuda.empty_cache()
+
+    # ========================================================================
+    # Task: Identify Utility-Critical Neurons
+    # ========================================================================
+    elif args.task == "identify_utility_neurons":
+        print("\n" + "=" * 70)
+        print("TASK: Identify Utility-Critical Neurons")
+        print("=" * 70)
+
+        # Load model and tokenizer
+        print(f"\nLoading model {args.model}...")
+        model = get_llm(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(
+            modeltype2path[args.model], use_fast=False
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Identify utility-critical neurons using utility dataset
+        analyzer = SafetyNeuronAnalyzer(model, tokenizer, device)
+        utility_masks, utility_scores = analyzer.identify_safety_critical_neurons(
+            prune_method=args.prune_method,
+            prune_data=args.prune_data,  # Should be "alpaca_cleaned_no_safety"
+            sparsity_ratio=args.sparsity_ratio,
+            nsamples=args.nsamples,
+            seed=args.seed,
+        )
+
+        # Save results
+        save_dir = os.path.join(args.results_path, "utility_neurons")
+        os.makedirs(save_dir, exist_ok=True)
+
+        torch.save(utility_masks, os.path.join(save_dir, "original_utility_masks.pt"))
+        torch.save(utility_scores, os.path.join(save_dir, "original_utility_scores.pt"))
+
+        print(f"\nSaved utility neuron data to {save_dir}")
+
+        # Clear memory
+        torch.cuda.empty_cache()
+
+    # ========================================================================
+    # Task: Fine-tune with Frozen Safety Neurons (Experiment 1)
+    # ========================================================================
+    elif args.task == "fine_tune_frozen":
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 1: Frozen-Regime Fine-Tuning")
+        print("=" * 70)
+
+        # Load model and tokenizer
+        print(f"\nLoading model {args.model}...")
+        model = get_llm(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(
+            modeltype2path[args.model], use_fast=False
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
         # Load safety masks
-        safety_masks = torch.load(args.safety_masks) 
-        
-        # Fine-tune the model (freezing is handled internally by FineTuner)
-        fine_tuner = FineTuner(model, tokenizer, device, safety_masks) 
-        
-        print("Fine-tuning model with frozen safety-critical neurons...")
+        if args.safety_masks is None:
+            raise ValueError("--safety_masks is required for fine_tune_frozen task")
+
+        print(f"\nLoading safety masks from {args.safety_masks}")
+        safety_masks = torch.load(args.safety_masks)
+
+        # Fine-tune the model with frozen safety neurons
+        fine_tuner = FineTuner(model, tokenizer, device, safety_masks)
+
+        print("\nFine-tuning model with frozen safety-critical neurons...")
         fine_tuned_model = fine_tuner.fine_tune_model(
             training_data=args.training_data,
             num_epochs=args.num_epochs,
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             max_length=args.max_length,
-            model_save_path=args.model_save_path
+            model_save_path=args.model_save_path,
         )
-        
+
         # Clear memory after fine-tuning
         torch.cuda.empty_cache()
-        print(f"GPU memory after fine-tuning: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Fine-tuning complete")
-        
-        # Recalculate safety-critical neuron scores
-        print("\nRecalculating safety-critical neuron scores for fine-tuned model...")
-        
-        # Create new analyzer for fine-tuned model
+
+        # Re-calculate safety-critical neuron scores on fine-tuned model
+        print("\nRe-calculating Wanda scores on fine-tuned model...")
         analyzer = SafetyNeuronAnalyzer(fine_tuned_model, tokenizer, device)
-        
-        # Identify safety-critical neurons on fine-tuned model
+
         new_safety_masks, new_safety_scores = analyzer.identify_safety_critical_neurons(
             prune_method=args.prune_method,
             prune_data=args.prune_data,
             sparsity_ratio=args.sparsity_ratio,
             nsamples=args.nsamples,
-            seed=args.seed
+            seed=args.seed,
         )
-        
-        # Clear memory after recalculating safety-critical neuron scores
-        torch.cuda.empty_cache()
-        print(f"GPU memory after recalculating safety-critical neuron scores: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Recalculation complete")
 
-        # Save safety masks and scores
-        print("\nSaving safety masks and scores for fine-tuned model...")
+        # Save results
         save_dir = os.path.join(args.results_path, "safety_neurons")
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Save masks and scores 
-        torch.save(new_safety_masks, os.path.join(save_dir, "fine_tuned_safety_masks.pt"))
-        torch.save(new_safety_scores, os.path.join(save_dir, "fine_tuned_safety_scores.pt"))
-        
-        print(f"Saved fine-tuned safety neuron data to {save_dir}")
-    
-    # Step 3: Evaluation 
-    elif args.task == "eval":
-        print("\n" + "="*50)
-        print("STEP 3: Evaluation")
-        print("="*50)
-        
-        # Load safety neuron data and initialize tracking variables
-        original_safety_masks = torch.load(args.original_safety_masks_path)
-        fine_tuned_safety_masks = torch.load(args.fine_tuned_safety_masks_path)
-        original_safety_scores = torch.load(args.original_safety_scores_path)
-        fine_tuned_safety_scores = torch.load(args.fine_tuned_safety_scores_path)
-        
-        comparison_results = {}
-        total_overlap = total_original = total_new = 0
-        overall_original_scores = []
-        overall_new_scores = []
-        
-        print("\nComparing safety-critical neurons and scores before/after fine-tuning:")
-        
-        # Process each layer
-        for layer_name in fine_tuned_safety_scores:
-            # Get masks and calculate overlap statistics
-            original_mask = original_safety_masks[layer_name]
-            new_mask = fine_tuned_safety_masks[layer_name]
-            
-            overlap = torch.logical_and(original_mask, new_mask).sum().item()
-            original_count = original_mask.sum().item()
-            new_count = new_mask.sum().item()
-            
-            total_overlap += overlap
-            total_original += original_count
-            total_new += new_count
-            
-            overlap_pct_original = 100 * overlap / original_count if original_count > 0 else 0
-            overlap_pct_new = 100 * overlap / new_count if new_count > 0 else 0
-            
-            # Get score statistics
-            original_scores = original_safety_scores[layer_name]
-            new_scores = fine_tuned_safety_scores[layer_name]
-            
-            orig_stats = {
-                "mean": original_scores.mean().item(),
-                "std": original_scores.std().item(),
-                "min": original_scores.min().item(),
-                "max": original_scores.max().item()
-            }
-            
-            new_stats = {
-                "mean": new_scores.mean().item(),
-                "std": new_scores.std().item(),
-                "min": new_scores.min().item(),
-                "max": new_scores.max().item()
-            }
-            
-            # Store results
-            comparison_results[layer_name] = {
-                "original_count": original_count,
-                "new_count": new_count,
-                "overlap": overlap,
-                "overlap_pct_original": overlap_pct_original,
-                "overlap_pct_new": overlap_pct_new,
-                "original_score_stats": orig_stats,
-                "new_score_stats": new_stats
-            }
-            
-            # Print layer results
-            print(f"\nLayer {layer_name}:")
-            print(f"  Neuron counts - Original: {original_count}, New: {new_count}, Overlap: {overlap}")
-            print(f"  Overlap % - Of original preserved: {overlap_pct_original:.2f}%, Of new from original: {overlap_pct_new:.2f}%")
-            print(f"  Original scores - Mean: {orig_stats['mean']:.4f}, Std: {orig_stats['std']:.4f}, Min: {orig_stats['min']:.4f}, Max: {orig_stats['max']:.4f}")
-            print(f"  New scores     - Mean: {new_stats['mean']:.4f}, Std: {new_stats['std']:.4f}, Min: {new_stats['min']:.4f}, Max: {new_stats['max']:.4f}")
-            
-            overall_original_scores.append(original_scores)
-            overall_new_scores.append(new_scores)
-        
-        # Calculate and store overall statistics
-        total_overlap_pct_original = 100 * total_overlap / total_original if total_original > 0 else 0
-        total_overlap_pct_new = 100 * total_overlap / total_new if total_new > 0 else 0
-        
-        overall_orig = torch.cat(overall_original_scores)
-        overall_new = torch.cat(overall_new_scores)
-        
-        overall_orig_stats = {
-            "mean": overall_orig.mean().item(),
-            "std": overall_orig.std().item(),
-            "min": overall_orig.min().item(),
-            "max": overall_orig.max().item()
-        }
-        
-        overall_new_stats = {
-            "mean": overall_new.mean().item(),
-            "std": overall_new.std().item(),
-            "min": overall_new.min().item(),
-            "max": overall_new.max().item()
-        }
-        
-        comparison_results["overall"] = {
-            "original_count": total_original,
-            "new_count": total_new,
-            "overlap": total_overlap,
-            "overlap_pct_original": total_overlap_pct_original,
-            "overlap_pct_new": total_overlap_pct_new,
-            "original_score_stats": overall_orig_stats,
-            "new_score_stats": overall_new_stats
-        }
-        
-        # Print overall summary
-        print("\nOverall Summary:")
-        print(f"Total neurons - Original: {total_original}, New: {total_new}, Overlap: {total_overlap}")
-        print(f"Overall overlap % - Of original preserved: {total_overlap_pct_original:.2f}%, Of new from original: {total_overlap_pct_new:.2f}%")
-        print(f"Overall original scores - Mean: {overall_orig_stats['mean']:.4f}, Std: {overall_orig_stats['std']:.4f}, Min: {overall_orig_stats['min']:.4f}, Max: {overall_orig_stats['max']:.4f}")
-        print(f"Overall new scores     - Mean: {overall_new_stats['mean']:.4f}, Std: {overall_new_stats['std']:.4f}, Min: {overall_new_stats['min']:.4f}, Max: {overall_new_stats['max']:.4f}")
 
-        # Save results to JSON file
-        results_file = os.path.join(args.results_path, "neuron_comparison_results.json")
-        stats_file_new = os.path.join(args.results_path, "new_scores_stats.json") 
-        stats_file_orig = os.path.join(args.results_path, "original_scores_stats.json")
-        os.makedirs(os.path.dirname(results_file), exist_ok=True)
-        
-        with open(results_file, "w") as f:
-            json.dump(comparison_results, f, indent=4)
-        with open(stats_file_new, "w") as f:
-            json.dump(overall_new_stats, f, indent=4)
-        with open(stats_file_orig, "w") as f:
-            json.dump(overall_orig_stats, f, indent=4)
-            
-        print(f"\nResults saved to {results_file}")
-        print(f"New scores stats saved to {stats_file_new}")
-        print(f"Original scores stats saved to {stats_file_orig}")
+        torch.save(
+            new_safety_masks, os.path.join(save_dir, "fine_tuned_safety_masks.pt")
+        )
+        torch.save(
+            new_safety_scores, os.path.join(save_dir, "fine_tuned_safety_scores.pt")
+        )
 
-        # Clear memory after Step 3
+        print(f"\nSaved fine-tuned safety neuron data to {save_dir}")
+
+        # Optionally evaluate ASR
+        if args.eval_attack:
+            asr_results = evaluate_model_safety(
+                model_path=args.model_save_path,
+                tokenizer=tokenizer,
+                save_dir=os.path.join(args.results_path, "attack_results"),
+                prefix="fine_tuned_frozen",
+            )
+
+            # Save ASR results
+            with open(
+                os.path.join(args.results_path, "asr_results_frozen.json"), "w"
+            ) as f:
+                json.dump(asr_results, f, indent=4)
+
+        # Clear memory
         torch.cuda.empty_cache()
-        print(f"GPU memory after Step 3: {torch.cuda.memory_allocated()/1024**3:.2f} GB" if torch.cuda.is_available() else "Step 3 complete")
+
+    # ========================================================================
+    # Task: Fine-tune without Freezing (Experiment 2)
+    # ========================================================================
+    elif args.task == "fine_tune_unfrozen":
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 2: Unfrozen Fine-Tuning (Weight Drift Tracking)")
+        print("=" * 70)
+
+        # Load model and tokenizer
+        print(f"\nLoading model {args.model}...")
+        model = get_llm(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(
+            modeltype2path[args.model], use_fast=False
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Capture original weights before fine-tuning
+        print("\nCapturing original model weights...")
+        original_weights = capture_model_weights(model)
+
+        # Save original weights
+        weights_save_path = os.path.join(args.results_path, "original_weights.pt")
+        os.makedirs(os.path.dirname(weights_save_path), exist_ok=True)
+        torch.save(original_weights, weights_save_path)
+        print(f"Saved original weights to {weights_save_path}")
+
+        # Fine-tune the model WITHOUT freezing (pass empty masks)
+        fine_tuner = FineTuner(model, tokenizer, device, safety_masks=None)
+
+        print("\nFine-tuning model without freezing any neurons...")
+        fine_tuned_model = fine_tuner.fine_tune_model(
+            training_data=args.training_data,
+            num_epochs=args.num_epochs,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            model_save_path=args.model_save_path,
+        )
+
+        print(f"\nFine-tuned model saved to {args.model_save_path}")
+
+        # Optionally evaluate ASR
+        if args.eval_attack:
+            asr_results = evaluate_model_safety(
+                model_path=args.model_save_path,
+                tokenizer=tokenizer,
+                save_dir=os.path.join(args.results_path, "attack_results"),
+                prefix="fine_tuned_unfrozen",
+            )
+
+            # Save ASR results
+            with open(
+                os.path.join(args.results_path, "asr_results_unfrozen.json"), "w"
+            ) as f:
+                json.dump(asr_results, f, indent=4)
+
+        # Clear memory
+        torch.cuda.empty_cache()
+
+    # ========================================================================
+    # Task: Evaluate Score Dynamics (Experiment 1 Analysis)
+    # ========================================================================
+    elif args.task == "eval_score_dynamics":
+        print("\n" + "=" * 70)
+        print("EVALUATION: Score Dynamics Analysis (Experiment 1)")
+        print("=" * 70)
+
+        # Load score data
+        print("\nLoading score data...")
+        original_scores = torch.load(args.original_safety_scores_path)
+        fine_tuned_scores = torch.load(args.fine_tuned_safety_scores_path)
+        safety_masks = torch.load(args.original_safety_masks_path)
+
+        # Analyze score distributions
+        print("\nComparing score distributions...")
+        score_dist = ScoreDynamicsAnalyzer.compare_score_distributions(
+            original_scores, fine_tuned_scores, safety_masks
+        )
+
+        # Compute score drop percentages
+        print("\nComputing score drop percentages...")
+        score_drops = ScoreDynamicsAnalyzer.compute_score_drop_percentage(
+            original_scores, fine_tuned_scores, safety_masks
+        )
+
+        # Compute statistics
+        results = {
+            "score_distributions": {},
+            "score_drops_per_layer": score_drops,
+        }
+
+        for regime in ["original", "new"]:
+            for category in ["all", "safety"]:
+                tensor = score_dist[regime][category]
+                if len(tensor) > 0:
+                    results["score_distributions"][f"{regime}_{category}"] = {
+                        "mean": tensor.mean().item(),
+                        "std": tensor.std().item(),
+                        "median": tensor.median().item(),
+                        "min": tensor.min().item(),
+                        "max": tensor.max().item(),
+                        "count": len(tensor),
+                    }
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("SCORE DYNAMICS SUMMARY")
+        print("=" * 70)
+
+        print("\nOriginal Safety Neurons:")
+        if "original_safety" in results["score_distributions"]:
+            stats = results["score_distributions"]["original_safety"]
+            print(
+                f"  Mean: {stats['mean']:.6f}, Std: {stats['std']:.6f}, "
+                f"Median: {stats['median']:.6f}"
+            )
+
+        print("\nFine-tuned Safety Neurons:")
+        if "new_safety" in results["score_distributions"]:
+            stats = results["score_distributions"]["new_safety"]
+            print(
+                f"  Mean: {stats['mean']:.6f}, Std: {stats['std']:.6f}, "
+                f"Median: {stats['median']:.6f}"
+            )
+
+        # Compute overall score drop
+        if (
+            "original_safety" in results["score_distributions"]
+            and "new_safety" in results["score_distributions"]
+        ):
+            orig_mean = results["score_distributions"]["original_safety"]["mean"]
+            new_mean = results["score_distributions"]["new_safety"]["mean"]
+            pct_change = ((new_mean - orig_mean) / orig_mean) * 100
+            print(f"\nOverall Score Change: {pct_change:+.2f}%")
+
+            if pct_change < -10:
+                print(
+                    "  → Supports Hypothesis A: Representational drift causing score drops"
+                )
+            else:
+                print(
+                    "  → Supports Hypothesis B: Scores remain stable despite freezing"
+                )
+
+        # Save results
+        results_file = os.path.join(args.results_path, "score_dynamics_analysis.json")
+        os.makedirs(os.path.dirname(results_file), exist_ok=True)
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=4)
+
+        print(f"\nResults saved to {results_file}")
+
+    # ========================================================================
+    # Task: Evaluate Weight Drift (Experiment 2 Analysis)
+    # ========================================================================
+    elif args.task == "eval_weight_drift":
+        print("\n" + "=" * 70)
+        print("EVALUATION: Weight Drift Analysis (Experiment 2)")
+        print("=" * 70)
+
+        # Load weight data
+        print("\nLoading weight data...")
+        original_weights = torch.load(args.original_weights_path)
+
+        print(f"Loading fine-tuned model from {args.fine_tuned_model_path}...")
+        fine_tuned_model = AutoModelForCausalLM.from_pretrained(
+            args.fine_tuned_model_path
+        )
+        fine_tuned_weights = capture_model_weights(fine_tuned_model)
+
+        # Load masks
+        safety_masks = torch.load(args.safety_masks_path)
+        utility_masks = (
+            torch.load(args.utility_masks_path) if args.utility_masks_path else None
+        )
+
+        # Analyze drift
+        print("\nAnalyzing weight drift by neuron category...")
+        drift_analyzer = WeightDriftAnalyzer(original_weights, fine_tuned_weights)
+
+        drift_results = drift_analyzer.analyze_drift_by_category(
+            safety_masks=safety_masks,
+            utility_masks=utility_masks,
+            random_sample_ratio=0.05,
+        )
+
+        # Compute statistics
+        results = {}
+        for category in ["safety", "utility", "random"]:
+            results[category] = {
+                "cosine_similarity": WeightDriftAnalyzer.compute_statistics(
+                    drift_results[category]["cosine_sim"]
+                ),
+                "l2_distance": WeightDriftAnalyzer.compute_statistics(
+                    drift_results[category]["l2_dist"]
+                ),
+            }
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("WEIGHT DRIFT SUMMARY")
+        print("=" * 70)
+
+        for category in ["safety", "utility", "random"]:
+            if results[category]["cosine_similarity"]["count"] > 0:
+                cos_stats = results[category]["cosine_similarity"]
+                l2_stats = results[category]["l2_distance"]
+
+                print(f"\n{category.upper()} Neurons:")
+                print(
+                    f"  Cosine Similarity: Mean={cos_stats['mean']:.4f}, "
+                    f"Std={cos_stats['std']:.4f}, Median={cos_stats['median']:.4f}"
+                )
+                print(
+                    f"  L2 Distance: Mean={l2_stats['mean']:.4f}, "
+                    f"Std={l2_stats['std']:.4f}, Median={l2_stats['median']:.4f}"
+                )
+                print(f"  Count: {cos_stats['count']}")
+
+        # Hypothesis testing
+        print("\n" + "=" * 70)
+        print("HYPOTHESIS TESTING")
+        print("=" * 70)
+
+        if (
+            results["safety"]["cosine_similarity"]["count"] > 0
+            and results["random"]["cosine_similarity"]["count"] > 0
+        ):
+            safety_cos = results["safety"]["cosine_similarity"]["mean"]
+            random_cos = results["random"]["cosine_similarity"]["mean"]
+
+            print(
+                f"\nSafety neurons cosine similarity: {safety_cos:.4f}"
+            )
+            print(f"Random neurons cosine similarity: {random_cos:.4f}")
+
+            if safety_cos < random_cos - 0.05:  # Safety drifts more
+                print(
+                    "\n→ Supports Hypothesis C: Safety-critical neurons are fragile (high drift)"
+                )
+            else:
+                print(
+                    "\n→ Supports Hypothesis D: Safety neurons stable, "
+                    "safety degradation from recontextualization"
+                )
+
+        # Save results
+        results_file = os.path.join(args.results_path, "weight_drift_analysis.json")
+        os.makedirs(os.path.dirname(results_file), exist_ok=True)
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=4)
+
+        print(f"\nResults saved to {results_file}")
+
+        # Clear memory
+        torch.cuda.empty_cache()
+
+    print("\n" + "=" * 70)
+    print("TASK COMPLETED")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

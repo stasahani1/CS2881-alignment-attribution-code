@@ -4,10 +4,12 @@ from typing import Dict
 from datasets import Dataset
 from transformers import DataCollatorForLanguageModeling
 from transformers import TrainingArguments, Trainer
+from vllm import LLM
 
 from .data import get_loaders
 from .prune import check_sparsity, find_layers
 from .model_wrapper import make_Act, revert_Act_to_Linear, ActLinear, no_act_recording
+from .eval import eval_attack
 
 class SafetyNeuronAnalyzer:
     """
@@ -227,25 +229,28 @@ class FineTuner:
         )
         
         # Convert to HuggingFace dataset format
-        def tokenize_function(examples):
-            # This is a simplified tokenization 
-            inputs = []
-            targets = []
-            for inp, tar in zip(examples["input_ids"], examples["labels"]):
-                inputs.append(inp)
-                targets.append(tar)
-            return {"input_ids": inputs, "labels": targets}
-        
-        # Create dataset
-        dataset_dict = {
-            "input_ids": [inp.squeeze() for inp, _ in trainloader],
-            "labels": [tar.squeeze() for _, tar in trainloader]
-        }
-        dataset = Dataset.from_dict(dataset_dict)
+        # Build dataset iteratively to handle large tensors properly
+        dataset_list = []
+        for inp, tar in trainloader:
+            # Convert tensors to lists and handle truncation
+            inp_ids = inp.squeeze().tolist()
+            tar_ids = tar.squeeze().tolist()
+
+            # Truncate if necessary
+            if len(inp_ids) > max_length:
+                inp_ids = inp_ids[:max_length]
+                tar_ids = tar_ids[:max_length]
+
+            dataset_list.append({
+                "input_ids": inp_ids,
+                "labels": tar_ids
+            })
+
+        dataset = Dataset.from_list(dataset_list)
         
         # Training arguments
         training_args = TrainingArguments(
-            output_dir=save_path,
+            output_dir=model_save_path,
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
             learning_rate=learning_rate,
@@ -276,10 +281,369 @@ class FineTuner:
         
         # Train the model
         trainer.train()
-        
+
         # Save the fine-tuned model
-        trainer.save_model(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        
-        print(f"Fine-tuning completed. Model saved to {save_path}")
+        trainer.save_model(model_save_path)
+        self.tokenizer.save_pretrained(model_save_path)
+
+        print(f"Fine-tuning completed. Model saved to {model_save_path}")
         return self.model
+
+
+class WeightDriftAnalyzer:
+    """
+    Analyzes weight drift for different neuron categories during fine-tuning.
+    Used for Experiment 2 (Unfrozen Fine-Tuning).
+    """
+
+    def __init__(self, original_weights: Dict[str, torch.Tensor],
+                 fine_tuned_weights: Dict[str, torch.Tensor]):
+        """
+        Args:
+            original_weights: Dictionary mapping layer names to pre-fine-tuning weights
+            fine_tuned_weights: Dictionary mapping layer names to post-fine-tuning weights
+        """
+        self.original_weights = original_weights
+        self.fine_tuned_weights = fine_tuned_weights
+
+    def compute_cosine_similarity(self, layer_name: str, neuron_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute cosine similarity between original and fine-tuned weights.
+
+        Args:
+            layer_name: Name of the layer
+            neuron_mask: Boolean mask indicating which neurons to analyze (None = all)
+
+        Returns:
+            Tensor of cosine similarities per neuron
+        """
+        if layer_name not in self.original_weights or layer_name not in self.fine_tuned_weights:
+            raise ValueError(f"Layer {layer_name} not found in weight dictionaries")
+
+        orig = self.original_weights[layer_name]
+        fine = self.fine_tuned_weights[layer_name]
+
+        # Apply mask if provided
+        if neuron_mask is not None:
+            orig = orig[neuron_mask]
+            fine = fine[neuron_mask]
+
+        # Compute cosine similarity per neuron (row-wise for weight matrices)
+        # Shape: (out_features, in_features) -> compute similarity per output neuron
+        orig_norm = torch.nn.functional.normalize(orig, p=2, dim=1)
+        fine_norm = torch.nn.functional.normalize(fine, p=2, dim=1)
+
+        # Cosine similarity: dot product of normalized vectors
+        cosine_sim = (orig_norm * fine_norm).sum(dim=1)
+
+        return cosine_sim
+
+    def compute_l2_distance(self, layer_name: str, neuron_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute L2 distance between original and fine-tuned weights.
+
+        Args:
+            layer_name: Name of the layer
+            neuron_mask: Boolean mask indicating which neurons to analyze (None = all)
+
+        Returns:
+            Tensor of L2 distances per neuron
+        """
+        if layer_name not in self.original_weights or layer_name not in self.fine_tuned_weights:
+            raise ValueError(f"Layer {layer_name} not found in weight dictionaries")
+
+        orig = self.original_weights[layer_name]
+        fine = self.fine_tuned_weights[layer_name]
+
+        # Apply mask if provided
+        if neuron_mask is not None:
+            orig = orig[neuron_mask]
+            fine = fine[neuron_mask]
+
+        # Compute L2 distance per neuron (row-wise)
+        l2_dist = torch.norm(orig - fine, p=2, dim=1)
+
+        return l2_dist
+
+    def analyze_drift_by_category(self, safety_masks: Dict[str, torch.Tensor],
+                                   utility_masks: Dict[str, torch.Tensor] = None,
+                                   random_sample_ratio: float = 0.05) -> Dict:
+        """
+        Compare drift for safety-critical, utility-critical, and random neurons.
+
+        Args:
+            safety_masks: Dictionary mapping layer names to safety-critical neuron masks
+            utility_masks: Dictionary mapping layer names to utility-critical neuron masks
+            random_sample_ratio: Ratio of random neurons to sample for comparison
+
+        Returns:
+            Dictionary with drift statistics per category
+        """
+        results = {
+            "safety": {"cosine_sim": [], "l2_dist": []},
+            "utility": {"cosine_sim": [], "l2_dist": []},
+            "random": {"cosine_sim": [], "l2_dist": []}
+        }
+
+        for layer_name in safety_masks.keys():
+            if layer_name not in self.original_weights:
+                continue
+
+            # Safety neurons
+            safety_mask = safety_masks[layer_name]
+            if safety_mask.sum() > 0:
+                cos_sim = self.compute_cosine_similarity(layer_name, safety_mask)
+                l2_dist = self.compute_l2_distance(layer_name, safety_mask)
+                results["safety"]["cosine_sim"].append(cos_sim)
+                results["safety"]["l2_dist"].append(l2_dist)
+
+            # Utility neurons
+            if utility_masks is not None and layer_name in utility_masks:
+                utility_mask = utility_masks[layer_name]
+                if utility_mask.sum() > 0:
+                    cos_sim = self.compute_cosine_similarity(layer_name, utility_mask)
+                    l2_dist = self.compute_l2_distance(layer_name, utility_mask)
+                    results["utility"]["cosine_sim"].append(cos_sim)
+                    results["utility"]["l2_dist"].append(l2_dist)
+
+            # Random neurons (excluding safety and utility)
+            combined_mask = safety_mask.clone()
+            if utility_masks is not None and layer_name in utility_masks:
+                combined_mask = torch.logical_or(combined_mask, utility_masks[layer_name])
+
+            random_mask = torch.logical_not(combined_mask)
+            num_random = int(random_mask.sum().item() * random_sample_ratio)
+
+            if num_random > 0:
+                # Sample random neurons
+                random_indices = torch.where(random_mask)[0]
+                sampled_indices = random_indices[torch.randperm(len(random_indices))[:num_random]]
+                random_sample_mask = torch.zeros_like(random_mask)
+                random_sample_mask[sampled_indices] = True
+
+                cos_sim = self.compute_cosine_similarity(layer_name, random_sample_mask)
+                l2_dist = self.compute_l2_distance(layer_name, random_sample_mask)
+                results["random"]["cosine_sim"].append(cos_sim)
+                results["random"]["l2_dist"].append(l2_dist)
+
+        # Concatenate results across all layers
+        for category in results.keys():
+            if len(results[category]["cosine_sim"]) > 0:
+                results[category]["cosine_sim"] = torch.cat(results[category]["cosine_sim"])
+                results[category]["l2_dist"] = torch.cat(results[category]["l2_dist"])
+            else:
+                results[category]["cosine_sim"] = torch.tensor([])
+                results[category]["l2_dist"] = torch.tensor([])
+
+        return results
+
+    @staticmethod
+    def compute_statistics(tensor: torch.Tensor) -> Dict:
+        """
+        Compute summary statistics for a tensor.
+
+        Args:
+            tensor: Input tensor
+
+        Returns:
+            Dictionary with mean, std, median, min, max
+        """
+        if len(tensor) == 0:
+            return {"mean": 0, "std": 0, "median": 0, "min": 0, "max": 0, "count": 0}
+
+        return {
+            "mean": tensor.mean().item(),
+            "std": tensor.std().item(),
+            "median": tensor.median().item(),
+            "min": tensor.min().item(),
+            "max": tensor.max().item(),
+            "count": len(tensor)
+        }
+
+
+class ScoreDynamicsAnalyzer:
+    """
+    Analyzes how Wanda scores change for frozen safety-critical neurons.
+    Used for Experiment 1 (Frozen-Regime Fine-Tuning).
+    """
+
+    @staticmethod
+    def compare_score_distributions(original_scores: Dict[str, torch.Tensor],
+                                     new_scores: Dict[str, torch.Tensor],
+                                     safety_masks: Dict[str, torch.Tensor]) -> Dict:
+        """
+        Compare score distributions before and after fine-tuning for safety neurons.
+
+        Args:
+            original_scores: Pre-fine-tuning Wanda scores per layer
+            new_scores: Post-fine-tuning Wanda scores per layer
+            safety_masks: Boolean masks indicating safety-critical neurons
+
+        Returns:
+            Dictionary with statistical comparison
+        """
+        results = {
+            "original": {"all": [], "safety": []},
+            "new": {"all": [], "safety": []}
+        }
+
+        for layer_name in safety_masks.keys():
+            if layer_name not in original_scores or layer_name not in new_scores:
+                continue
+
+            orig = original_scores[layer_name].flatten()
+            new = new_scores[layer_name].flatten()
+            mask = safety_masks[layer_name].flatten()
+
+            # All neurons
+            results["original"]["all"].append(orig)
+            results["new"]["all"].append(new)
+
+            # Safety-critical neurons only
+            if mask.sum() > 0:
+                results["original"]["safety"].append(orig[mask])
+                results["new"]["safety"].append(new[mask])
+
+        # Concatenate across layers
+        for regime in ["original", "new"]:
+            for category in ["all", "safety"]:
+                if len(results[regime][category]) > 0:
+                    results[regime][category] = torch.cat(results[regime][category])
+                else:
+                    results[regime][category] = torch.tensor([])
+
+        return results
+
+    @staticmethod
+    def compute_score_drop_percentage(original_scores: Dict[str, torch.Tensor],
+                                       new_scores: Dict[str, torch.Tensor],
+                                       safety_masks: Dict[str, torch.Tensor]) -> Dict:
+        """
+        Compute percentage drop in Wanda scores for frozen safety neurons.
+
+        Args:
+            original_scores: Pre-fine-tuning Wanda scores per layer
+            new_scores: Post-fine-tuning Wanda scores per layer
+            safety_masks: Boolean masks indicating safety-critical neurons
+
+        Returns:
+            Dictionary with drop percentages per layer and overall
+        """
+        results = {}
+
+        for layer_name in safety_masks.keys():
+            if layer_name not in original_scores or layer_name not in new_scores:
+                continue
+
+            orig = original_scores[layer_name].flatten()
+            new = new_scores[layer_name].flatten()
+            mask = safety_masks[layer_name].flatten()
+
+            if mask.sum() == 0:
+                continue
+
+            orig_safety = orig[mask]
+            new_safety = new[mask]
+
+            # Avoid division by zero
+            orig_safety_safe = torch.where(orig_safety == 0, torch.ones_like(orig_safety) * 1e-10, orig_safety)
+
+            # Percentage change: (new - orig) / orig * 100
+            pct_change = ((new_safety - orig_safety) / orig_safety_safe * 100)
+
+            results[layer_name] = {
+                "mean_pct_change": pct_change.mean().item(),
+                "median_pct_change": pct_change.median().item(),
+                "std_pct_change": pct_change.std().item(),
+                "original_mean_score": orig_safety.mean().item(),
+                "new_mean_score": new_safety.mean().item()
+            }
+
+        return results
+
+
+def capture_model_weights(model) -> Dict[str, torch.Tensor]:
+    """
+    Capture a snapshot of model weights for drift analysis.
+    Reuses find_layers from lib.prune for consistency.
+
+    Args:
+        model: PyTorch model
+
+    Returns:
+        Dictionary mapping layer names to weight tensors
+    """
+    weights = {}
+    linear_layers = find_layers(model)
+
+    for name, module in linear_layers.items():
+        if hasattr(module, 'weight'):
+            weights[name] = module.weight.data.clone().detach().cpu()
+
+    return weights
+
+
+def evaluate_model_safety(model_path: str, tokenizer, save_dir: str,
+                          prefix: str = "") -> Dict:
+    """
+    Evaluate model safety using ASR (Attack Success Rate) on AdvBench dataset.
+    Reuses eval_attack() from lib.eval for consistency with base codebase.
+
+    Args:
+        model_path: Path to model (for vLLM loading)
+        tokenizer: Tokenizer for the model
+        save_dir: Directory to save attack results
+        prefix: Prefix for result filenames (e.g., "original", "fine_tuned")
+
+    Returns:
+        Dictionary with ASR scores for different attack configurations
+    """
+    import os
+
+    print(f"\n{'='*50}")
+    print(f"Evaluating model safety: {prefix}")
+    print(f"{'='*50}")
+
+    # Load model with vLLM for efficient generation
+    # Note: eval_attack expects a vLLM model
+    vllm_model = LLM(model=model_path, tensor_parallel_size=1)
+
+    results = {}
+
+    # Test configurations from base paper
+    configs = [
+        {"name": "inst_basic", "add_sys_prompt": True, "include_inst": True, "gcg": False},
+        {"name": "inst_basic_no_sys", "add_sys_prompt": False, "include_inst": True, "gcg": False},
+        {"name": "no_inst_basic", "add_sys_prompt": True, "include_inst": False, "gcg": False},
+        {"name": "no_inst_basic_no_sys", "add_sys_prompt": False, "include_inst": False, "gcg": False},
+        {"name": "gcg", "add_sys_prompt": False, "include_inst": True, "gcg": True},
+    ]
+
+    for config in configs:
+        config_name = config["name"]
+        print(f"\nRunning attack configuration: {config_name}")
+
+        filename = os.path.join(save_dir, f"{prefix}_{config_name}.jsonl")
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        asr_score = eval_attack(
+            model=vllm_model,
+            tokenizer=tokenizer,
+            num_sampled=1,
+            add_sys_prompt=config["add_sys_prompt"],
+            prompt_template_style="base",
+            do_sample=not config["gcg"],
+            gcg=config["gcg"],
+            include_inst=config["include_inst"],
+            save_attack_res=True,
+            filename=filename
+        )
+
+        results[config_name] = asr_score
+        print(f"  ASR Score: {asr_score:.4f}")
+
+    # Compute average ASR
+    results["average_asr"] = sum(results.values()) / len(results)
+    print(f"\nAverage ASR: {results['average_asr']:.4f}")
+
+    return results

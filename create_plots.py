@@ -8,6 +8,8 @@ Create 3 plots for Figure 2a:
 
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import glob
 
 # Data extracted from results/fig2a/
 data = {
@@ -30,6 +32,45 @@ data = {
         'no_inst_ASR_multiple_nosys': 0.2740,
     },
 }
+
+# Read set difference data from all sparsity folders
+def read_setdiff_data():
+    """Read data from results/fig2a/snip_setdiff/sparsity_*/log_wandg_set_difference.txt"""
+    setdiff_data = []
+
+    # Find all sparsity directories
+    sparsity_dirs = sorted(glob.glob('results/fig2a/snip_setdiff/sparsity_*'))
+
+    for sparsity_dir in sparsity_dirs:
+        log_file = os.path.join(sparsity_dir, 'log_wandg_set_difference.txt')
+        if not os.path.exists(log_file):
+            continue
+
+        # Parse the log file
+        metrics = {}
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+            for line in lines[1:]:  # Skip header
+                parts = line.strip().split('\t')
+                if len(parts) >= 6:
+                    metric_name = parts[4]
+                    score = float(parts[5])
+                    metrics[metric_name] = score
+
+        # Extract the relevant metrics
+        if 'averaged' in metrics:
+            data_point = {
+                'zero_shot': metrics.get('averaged', None),
+                'inst_ASR_multiple_nosys': metrics.get('inst_ASR_multiple_nosys', None),
+                'ASR_gcg': metrics.get('ASR_gcg', None),
+                'no_inst_ASR_multiple_nosys': metrics.get('no_inst_ASR_multiple_nosys', None),
+                'sparsity': os.path.basename(sparsity_dir)
+            }
+            setdiff_data.append(data_point)
+
+    return setdiff_data
+
+setdiff_data = read_setdiff_data()
 
 # Colors for each method
 colors = {
@@ -79,6 +120,19 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
                    fontsize=9,
                    alpha=0.7)
 
+    # Plot all set difference sparsity points (green triangles)
+    for point in setdiff_data:
+        x = point['zero_shot']
+        y = point[metric_key]
+        if x is not None and y is not None:
+            ax.scatter(x, y,
+                      color=colors['Set Difference'],
+                      marker=markers['Set Difference'],
+                      s=200,
+                      edgecolors='black',
+                      linewidth=1.5,
+                      alpha=0.8)
+
     # Formatting
     ax.set_xlabel('Zero-shot Accuracy (averaged)', fontsize=12, fontweight='bold')
     ax.set_ylabel(metric_label, fontsize=12, fontweight='bold')
@@ -126,6 +180,19 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
                    fontsize=11,
                    alpha=0.7)
 
+    # Plot all set difference sparsity points (green triangles)
+    for point in setdiff_data:
+        x = point['zero_shot']
+        y = point[metric_key]
+        if x is not None and y is not None:
+            ax.scatter(x, y,
+                      color=colors['Set Difference'],
+                      marker=markers['Set Difference'],
+                      s=300,
+                      edgecolors='black',
+                      linewidth=2,
+                      alpha=0.8)
+
     # Formatting
     ax.set_xlabel('Zero-shot Accuracy (averaged)', fontsize=14, fontweight='bold')
     ax.set_ylabel(metric_label, fontsize=14, fontweight='bold')
@@ -159,4 +226,12 @@ for method in ['Wanda', 'SNIP', 'Set Difference']:
           f"{data[method]['inst_ASR_multiple_nosys']:>15.4f} "
           f"{data[method]['ASR_gcg']:>12.4f} "
           f"{data[method]['no_inst_ASR_multiple_nosys']:>15.4f}")
+print("-"*80)
+print("\nSet Difference (all sparsity levels):")
+print("-"*80)
+for point in setdiff_data:
+    print(f"{point['sparsity']:<20} {point['zero_shot']:>12.4f} "
+          f"{point['inst_ASR_multiple_nosys']:>15.4f} "
+          f"{point['ASR_gcg']:>12.4f} "
+          f"{point['no_inst_ASR_multiple_nosys']:>15.4f}")
 print("="*80)

@@ -15,6 +15,28 @@ OUTPUT_DIR="results/fig2a/snip_setdiff"
 
 SPARSITIES=(0.005 0.010 0.015 0.020 0.025 0.030)
 
+# Use /dev/shm to avoid disk quota issues
+SCORE_BASE="/dev/shm/wanda_scores"
+mkdir -p "$SCORE_BASE"
+
+echo "=========================================="
+echo "STEP 0: Setting up symlinks to /dev/shm (to avoid disk quota)"
+echo "=========================================="
+
+# Create symlink structure if it doesn't exist
+if [ ! -L "out" ]; then
+    if [ -d "out" ]; then
+        echo "Moving existing out/ to /dev/shm..."
+        mv out "$SCORE_BASE/out"
+    else
+        mkdir -p "$SCORE_BASE/out"
+    fi
+    ln -s "$SCORE_BASE/out" out
+    echo "Created symlink: out -> $SCORE_BASE/out"
+else
+    echo "Symlink already exists, skipping..."
+fi
+
 echo "=========================================="
 echo "STEP 1: Dumping SNIP scores (this only needs to be done once)"
 echo "=========================================="
@@ -26,7 +48,9 @@ if [ ! -d "out/llama2-7b-chat-hf/unstructured/wandg/alpaca_cleaned_no_safety/wan
         --model $MODEL \
         --prune_method wandg \
         --prune_data alpaca_cleaned_no_safety \
-        --dump_wanda_score
+        --sparsity_ratio 0.01 \
+        --dump_wanda_score \
+        --save out/llama2-7b-chat-hf/unstructured/wandg/alpaca_cleaned_no_safety
     echo "Utility scores dumped!"
 else
     echo "Utility scores already exist, skipping..."
@@ -39,7 +63,9 @@ if [ ! -d "out/llama2-7b-chat-hf/unstructured/wandg/align/wanda_score" ]; then
         --model $MODEL \
         --prune_method wandg \
         --prune_data $PRUNE_DATA \
-        --dump_wanda_score
+        --sparsity_ratio 0.01 \
+        --dump_wanda_score \
+        --save out/llama2-7b-chat-hf/unstructured/wandg/align
     echo "Safety scores dumped!"
 else
     echo "Safety scores already exist, skipping..."
@@ -70,4 +96,3 @@ for SPARSITY in "${SPARSITIES[@]}"; do
 
       echo "Completed p=q=${SPARSITY}"
   done
-

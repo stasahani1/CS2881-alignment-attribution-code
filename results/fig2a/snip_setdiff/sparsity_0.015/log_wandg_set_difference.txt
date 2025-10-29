@@ -1,0 +1,16 @@
+method	actual_sparsity	p	q	metric	score
+wandg_set_difference	0.008982	0.015	0.015	PPL	8.9148
+wandg_set_difference	0.008982	0.015	0.015	inst_ASR_basic	0.2300
+wandg_set_difference	0.008982	0.015	0.015	inst_ASR_basic_nosys	0.7800
+wandg_set_difference	0.008982	0.015	0.015	inst_ASR_multiple_nosys	0.8240
+wandg_set_difference	0.008982	0.015	0.015	no_inst_ASR_basic	0.5800
+wandg_set_difference	0.008982	0.015	0.015	no_inst_ASR_basic_nosys	0.9700
+wandg_set_difference	0.008982	0.015	0.015	no_inst_ASR_multiple_nosys	0.8900
+wandg_set_difference	0.008982	0.015	0.015	ASR_gcg	0.9700
+wandg_set_difference	0.008982	0.015	0.015	arc_challenge	0.3550
+wandg_set_difference	0.008982	0.015	0.015	boolq	0.7500
+wandg_set_difference	0.008982	0.015	0.015	openbookqa	0.2750
+wandg_set_difference	0.008982	0.015	0.015	rte	0.5950
+wandg_set_difference	0.008982	0.015	0.015	winogrande	0.6400
+wandg_set_difference	0.008982	0.015	0.015	hellaswag	0.5300
+wandg_set_difference	0.008982	0.015	0.015	averaged	0.5242

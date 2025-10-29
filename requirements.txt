@@ -1,3 +1,6 @@
+fire==0.7.1
+hf-transfer==0.1.9
+termcolor==3.1.0
 absl-py==2.0.0
 accelerate==0.24.1
 aiohttp==3.9.0

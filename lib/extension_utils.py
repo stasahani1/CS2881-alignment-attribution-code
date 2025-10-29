@@ -47,7 +47,10 @@ class SafetyNeuronAnalyzer:
             - scores: Dictionary mapping layer names to importance scores for all neurons
         """
         print(f"Calculating {prune_method} scores on {prune_data} dataset...")
-        
+
+        # Clear GPU cache before starting
+        torch.cuda.empty_cache()
+
         # Convert model to ActLinear for score calculation (non-destructive)
         model = make_Act(self.model, verbose=False)
         
@@ -69,9 +72,9 @@ class SafetyNeuronAnalyzer:
         num_hidden_layers = model.config.num_hidden_layers
         for layer in range(num_hidden_layers):
             layer_filter_fn = lambda x: f"layers.{layer}." in x
-            
+
             print(f"Processing layer {layer}...")
-            
+
             # Enable gradients for this layer only
             model.zero_grad()
             model.requires_grad_(False)
@@ -80,7 +83,7 @@ class SafetyNeuronAnalyzer:
                     print(f"enabling grad for {name}")
                     module.base.requires_grad_(True)
                     module.base.zero_grad()
-            
+
             # Calculate gradients (importance scores)
             for batch in dataloader:
                 inp, tar = batch[0].to(self.device), batch[1].to(self.device)
@@ -88,40 +91,47 @@ class SafetyNeuronAnalyzer:
                 with no_act_recording(model):
                     loss = model(input_ids=inp, labels=tar)[0]
                 loss.backward()
-            
+
+                # Clear batch tensors immediately to free memory
+                del inp, tar, loss
+
             # Extract scores and create masks for this layer
             for name, module in model.named_modules():
                 if layer_filter_fn(name) and isinstance(module, ActLinear):
                     if prune_method == "wandg":
                         # SNIP: Use gradient magnitude as importance score
-                        scores = torch.abs(module.base.weight.grad)
+                        scores = torch.abs(module.base.weight.grad).cpu()
                     elif prune_method == "wanda":
                         # Wanda: Use |weight| * sqrt(activation_norm)
-                        scores = torch.abs(module.base.weight.data) * torch.sqrt(
+                        scores = (torch.abs(module.base.weight.data) * torch.sqrt(
                             module.activation_norms.reshape((1, -1))
-                        )
+                        )).cpu()
                     else:
                         raise ValueError(f"Unsupported prune method: {prune_method}")
-                    
-                    # Store all scores for this layer
+
+                    # Store all scores for this layer (on CPU to save GPU memory)
                     safety_scores[name] = scores.clone()
-                    
+
                     # Select top-k% as safety-critical neurons
                     flat_scores = scores.flatten()
                     num_to_select = int(flat_scores.numel() * sparsity_ratio)
-                    
+
                     if num_to_select > 0:
                         # Get threshold for top-k%
                         threshold_idx = flat_scores.numel() - num_to_select
                         threshold = torch.topk(flat_scores, threshold_idx, largest=False)[0][-1]
-                        
+
                         # Create mask for safety-critical neurons (top-k%)
                         mask = scores >= threshold
                     else:
                         # If sparsity_ratio is 0, no neurons are safety-critical
                         mask = torch.zeros_like(scores, dtype=torch.bool)
-                    
+
                     safety_masks[name] = mask
+
+            # Clear gradients and cache after each layer
+            model.zero_grad()
+            torch.cuda.empty_cache()
         
         # Convert back to regular model (non-destructive)
         model = revert_Act_to_Linear(model)
@@ -249,10 +259,13 @@ class FineTuner:
         dataset = Dataset.from_list(dataset_list)
         
         # Training arguments
+        # Use gradient accumulation for memory efficiency on smaller GPUs
+        # Effective batch size = per_device_train_batch_size * gradient_accumulation_steps
         training_args = TrainingArguments(
             output_dir=model_save_path,
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=4,  # Accumulate gradients to simulate larger batch
             learning_rate=learning_rate,
             logging_steps=10,
             save_steps=500,
@@ -260,6 +273,8 @@ class FineTuner:
             save_total_limit=2,
             remove_unused_columns=False,
             dataloader_pin_memory=False,
+            fp16=True,  # Use mixed precision for memory efficiency
+            gradient_checkpointing=True,  # Set False if GPU > 60 GB
         )
         
         # Data collator
@@ -270,7 +285,11 @@ class FineTuner:
         
         # Freeze safety-critical neurons before training
         self.model = self._freeze_safety_critical_neurons()
-        
+
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+
         # Create trainer
         trainer = Trainer(
             model=self.model,

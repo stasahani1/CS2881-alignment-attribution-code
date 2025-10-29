@@ -190,13 +190,25 @@ results/
   - Compare `average_asr` across experiments
   - Higher ASR = more unsafe model
 
+## GPU Memory Requirements
+
+**Your GPU: 44GB** → Use the optimized config:
+```bash
+source scripts/config_44gb_gpu.sh
+./scripts/run_full_pipeline.sh
+```
+
+See [GPU_REQUIREMENTS.md](../GPU_REQUIREMENTS.md) for detailed memory analysis.
+
 ## Troubleshooting
 
 ### Out of Memory
-Reduce these settings:
+The code is already optimized for 44GB GPUs. If you still get OOM:
+
 ```bash
-BATCH_SIZE=2 \
-MAX_LENGTH=256 \
+# Further reduce memory usage
+BATCH_SIZE=1 \
+MAX_LENGTH=128 \
 NSAMPLES=64 \
 ./scripts/run_full_pipeline.sh
 ```

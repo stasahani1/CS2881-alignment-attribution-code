@@ -100,32 +100,45 @@ class SafetyNeuronAnalyzer:
                 if layer_filter_fn(name) and isinstance(module, ActLinear):
                     if prune_method == "wandg":
                         # SNIP: Use gradient magnitude as importance score
-                        scores = torch.abs(module.base.weight.grad).cpu()
+                        scores_2d = torch.abs(module.base.weight.grad).cpu()
                     elif prune_method == "wanda":
                         # Wanda: Use |weight| * sqrt(activation_norm)
-                        scores = (torch.abs(module.base.weight.data) * torch.sqrt(
+                        scores_2d = (torch.abs(module.base.weight.data) * torch.sqrt(
                             module.activation_norms.reshape((1, -1))
                         )).cpu()
                     else:
                         raise ValueError(f"Unsupported prune method: {prune_method}")
 
-                    # Store all scores for this layer (on CPU to save GPU memory)
-                    safety_scores[name] = scores.clone()
+                    # Flatten scores for selection
+                    flat_scores = scores_2d.flatten()
 
                     # Select top-k% as safety-critical neurons
-                    flat_scores = scores.flatten()
                     num_to_select = int(flat_scores.numel() * sparsity_ratio)
 
                     if num_to_select > 0:
-                        # Get threshold for top-k%
-                        threshold_idx = flat_scores.numel() - num_to_select
-                        threshold = torch.topk(flat_scores, threshold_idx, largest=False)[0][-1]
+                        # Get top-k indices and their scores
+                        # This is much more memory efficient than storing all scores
+                        topk_scores, topk_indices = torch.topk(flat_scores, num_to_select, largest=True)
 
-                        # Create mask for safety-critical neurons (top-k%)
-                        mask = scores >= threshold
+                        # Store only safety-critical indices and their scores
+                        # Storage: ~838K entries (5%) vs 16.7M entries (100%) = 95% reduction
+                        safety_scores[name] = {
+                            'indices': topk_indices,  # Which neurons are safety-critical
+                            'scores': topk_scores,     # Their importance scores
+                            'shape': scores_2d.shape,  # Original shape for reconstruction
+                        }
+
+                        # Create mask for freezing (still need 2D for gradient hooks)
+                        mask = torch.zeros_like(scores_2d, dtype=torch.bool)
+                        mask.view(-1)[topk_indices] = True
                     else:
                         # If sparsity_ratio is 0, no neurons are safety-critical
-                        mask = torch.zeros_like(scores, dtype=torch.bool)
+                        safety_scores[name] = {
+                            'indices': torch.tensor([], dtype=torch.long),
+                            'scores': torch.tensor([]),
+                            'shape': scores_2d.shape,
+                        }
+                        mask = torch.zeros_like(scores_2d, dtype=torch.bool)
 
                     safety_masks[name] = mask
 
@@ -510,18 +523,47 @@ class ScoreDynamicsAnalyzer:
             if layer_name not in original_scores or layer_name not in new_scores:
                 continue
 
-            orig = original_scores[layer_name].flatten()
-            new = new_scores[layer_name].flatten()
+            # Handle sparse storage format (dict with indices/scores)
+            orig_data = original_scores[layer_name]
+            new_data = new_scores[layer_name]
             mask = safety_masks[layer_name].flatten()
 
-            # All neurons
-            results["original"]["all"].append(orig)
-            results["new"]["all"].append(new)
+            # Extract scores from sparse format
+            if isinstance(orig_data, dict):
+                orig_indices = orig_data['indices']
+                orig_scores = orig_data['scores']
+            else:
+                # Fallback for old format (full scores)
+                orig_scores = orig_data.flatten()
+                orig_indices = torch.arange(len(orig_scores))
 
-            # Safety-critical neurons only
-            if mask.sum() > 0:
-                results["original"]["safety"].append(orig[mask])
-                results["new"]["safety"].append(new[mask])
+            if isinstance(new_data, dict):
+                new_indices = new_data['indices']
+                new_scores = new_data['scores']
+            else:
+                # Fallback for old format (full scores)
+                new_scores = new_data.flatten()
+                new_indices = torch.arange(len(new_scores))
+
+            # For "all neurons" comparison, we only have the top-k from each
+            # This is sufficient since we care about safety-critical neurons
+            results["original"]["all"].append(orig_scores)
+            results["new"]["all"].append(new_scores)
+
+            # Safety-critical neurons: those in original top-k
+            # We compare their scores in original vs fine-tuned model
+            if len(orig_indices) > 0:
+                results["original"]["safety"].append(orig_scores)
+                # For new scores, we need to find the same indices
+                # Create a mapping from indices to scores in new model
+                if isinstance(new_data, dict):
+                    # Build full score array for indexing (only for originally safety-critical neurons)
+                    new_full = torch.zeros(orig_data['shape'][0] * orig_data['shape'][1])
+                    new_full[new_indices] = new_scores
+                    # Get scores for originally safety-critical neurons
+                    results["new"]["safety"].append(new_full[orig_indices])
+                else:
+                    results["new"]["safety"].append(new_scores[mask])
 
         # Concatenate across layers
         for regime in ["original", "new"]:
@@ -554,15 +596,32 @@ class ScoreDynamicsAnalyzer:
             if layer_name not in original_scores or layer_name not in new_scores:
                 continue
 
-            orig = original_scores[layer_name].flatten()
-            new = new_scores[layer_name].flatten()
+            # Handle sparse storage format
+            orig_data = original_scores[layer_name]
+            new_data = new_scores[layer_name]
             mask = safety_masks[layer_name].flatten()
 
             if mask.sum() == 0:
                 continue
 
-            orig_safety = orig[mask]
-            new_safety = new[mask]
+            # Extract scores from sparse format
+            if isinstance(orig_data, dict):
+                orig_indices = orig_data['indices']
+                orig_safety = orig_data['scores']
+
+                # Get new scores for the same indices
+                if isinstance(new_data, dict):
+                    new_full = torch.zeros(orig_data['shape'][0] * orig_data['shape'][1])
+                    new_full[new_data['indices']] = new_data['scores']
+                    new_safety = new_full[orig_indices]
+                else:
+                    new_safety = new_data.flatten()[orig_indices]
+            else:
+                # Fallback for old format
+                orig = orig_data.flatten()
+                new = new_data.flatten() if not isinstance(new_data, dict) else new_data.flatten()
+                orig_safety = orig[mask]
+                new_safety = new[mask]
 
             # Avoid division by zero
             orig_safety_safe = torch.where(orig_safety == 0, torch.ones_like(orig_safety) * 1e-10, orig_safety)

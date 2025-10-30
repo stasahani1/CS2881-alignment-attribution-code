@@ -6,6 +6,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 from vllm import LLM
 
+# Set HuggingFace cache to /tmp/ to avoid filling workspace storage
+os.environ["HF_HOME"] = "/tmp/huggingface"
+
 from lib.prune import (
     prune_wanda,
     prune_random,

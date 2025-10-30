@@ -15,6 +15,9 @@ import argparse
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# Set HuggingFace cache to /tmp/ to avoid filling workspace storage
+os.environ["HF_HOME"] = "/tmp/huggingface"
+
 from main import modeltype2path, get_llm
 from lib.extension_utils import (
     SafetyNeuronAnalyzer,
@@ -188,7 +191,7 @@ def main():
     parser.add_argument(
         "--model_save_path",
         type=str,
-        default="./fine_tuned_model",
+        default="/tmp/fine_tuned_model",
         help="Path to save fine-tuned model"
     )
     parser.add_argument(

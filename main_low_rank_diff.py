@@ -325,10 +325,10 @@ if __name__ == "__main__":
 
     sanity_check = True
     modeltype2path = {
-        "llama2-7b-chat-hf": "",
-        "llama2-13b-chat-hf": "",
-        "llama2-7b-hf": "",
-        "llama2-13b-hf": "",
+        "llama2-7b-chat-hf": "/tmp/llama-2-7b-chat-hf",
+        "llama2-13b-chat-hf": "/tmp/llama-2-13b-chat-hf",
+        "llama2-7b-hf": "/tmp/llama-2-7b-hf",
+        "llama2-13b-hf": "/tmp/llama-2-13b-hf",
     }
 
     def get_llm(model_name, cache_dir="llm_weights"):

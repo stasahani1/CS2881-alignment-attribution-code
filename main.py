@@ -57,7 +57,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
             low_cpu_mem_usage=True,
             use_safetensors=False,  # Use .bin files only
             local_files_only=True,   # Use cached files (in /dev/shm/huggingface/)
-            # cache_dir is set via HF_HOME environment variable
+            cache_dir="/dev/shm/huggingface/hub",  # Explicitly set cache directory
         )
         # Move to GPU manually
         model = model.to('cuda:0')

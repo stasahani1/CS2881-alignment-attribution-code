@@ -24,8 +24,8 @@ class SafetyNeuronAnalyzer:
         self.safety_critical_scores = {}
         self.original_weights = {}
         
-    def identify_safety_critical_neurons(self, 
-                                      prune_method: str = "wandg", 
+    def identify_safety_critical_neurons(self,
+                                      prune_method: str = "wandg",
                                       prune_data: str = "align_short",
                                       sparsity_ratio: float = 0.1,
                                       nsamples: int = 128,
@@ -33,14 +33,15 @@ class SafetyNeuronAnalyzer:
         """
         Identify safety-critical neurons using SNIP/Wanda scores WITHOUT pruning.
         This approach calculates importance scores and selects top-k% without modifying the model.
-        
+        Works with both regular models and PEFT models (unwraps PEFT to score base model).
+
         Args:
             prune_method: Method to use ("wandg" for SNIP, "wanda" for Wanda)
             prune_data: Dataset to use for safety evaluation ("align" or "align_short")
             sparsity_ratio: Fraction of neurons to identify as safety-critical
             nsamples: Number of samples to use for scoring
             seed: Random seed for reproducibility
-            
+
         Returns:
             Tuple of (masks, scores) where:
             - masks: Dictionary mapping layer names to boolean masks indicating safety-critical neurons
@@ -51,8 +52,11 @@ class SafetyNeuronAnalyzer:
         # Clear GPU cache before starting
         torch.cuda.empty_cache()
 
+        # Get base model if PEFT-wrapped
+        model_to_score = self._unwrap_peft_model(self.model)
+
         # Convert model to ActLinear for score calculation (non-destructive)
-        model = make_Act(self.model, verbose=False)
+        model = make_Act(model_to_score, verbose=False)
         
         # Load calibration data
         dataloader, _ = get_loaders(
@@ -162,44 +166,98 @@ class SafetyNeuronAnalyzer:
         self.safety_critical_scores = safety_scores
         return safety_masks, safety_scores
 
+    def _unwrap_peft_model(self, model):
+        """
+        Unwrap PEFT model to get base model for scoring.
+
+        Args:
+            model: Potentially PEFT-wrapped model
+
+        Returns:
+            Base model (unwrapped from PEFT if applicable)
+        """
+        if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+            print("Detected PEFT model, unwrapping to base model for scoring...")
+            return model.base_model.model
+        return model
+
 
 
 class FineTuner:
     """
     Handles fine-tuning of models with frozen safety-critical neurons.
+    Supports both full fine-tuning and PEFT (LoRA) fine-tuning.
     """
-    
-    def __init__(self, model, tokenizer, device=torch.device("cuda:0"), safety_masks=None):
+
+    def __init__(self, model, tokenizer, device=torch.device("cuda:0"), safety_masks=None,
+                 use_peft=False, peft_r=8, peft_alpha=16, peft_target_modules="q_proj,v_proj"):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.safety_masks = safety_masks
+        self.use_peft = use_peft
+        self.peft_r = peft_r
+        self.peft_alpha = peft_alpha
+        self.peft_target_modules = peft_target_modules.split(",") if isinstance(peft_target_modules, str) else peft_target_modules
+
+        # Apply PEFT if requested
+        if self.use_peft:
+            self._apply_peft()
     
+    def _apply_peft(self):
+        """
+        Apply PEFT (LoRA) to the model.
+        LoRA adapters will train freely while base model neurons can be frozen.
+        """
+        try:
+            from peft import LoraConfig, get_peft_model, TaskType
+        except ImportError:
+            raise ImportError("PEFT library not found. Please install with: pip install peft")
+
+        print(f"Applying PEFT (LoRA) with r={self.peft_r}, alpha={self.peft_alpha}")
+        print(f"Target modules: {self.peft_target_modules}")
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=self.peft_r,
+            lora_alpha=self.peft_alpha,
+            lora_dropout=0.05,
+            target_modules=self.peft_target_modules,
+            bias="none"
+        )
+
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.print_trainable_parameters()
+
     def _freeze_safety_critical_neurons(self) -> nn.Module:
         """
         Freeze safety-critical neurons by setting their gradients to zero.
-        
-        Args:
-            model: The model to freeze neurons in
-            
+        Works with both regular models and PEFT models.
+
+        For PEFT models: Freezes base model neurons (not LoRA adapters).
+        This allows testing if LoRA can create "alternative pathways" around frozen neurons.
+
         Returns:
             The model with frozen safety-critical neurons
         """
         if self.safety_masks is None:
             print("Warning: No safety masks provided. Skipping neuron freezing.")
             return self.model
-            
+
         print("Freezing safety-critical neurons...")
-        
+
         frozen_count = 0
         total_count = 0
-        
+
+        # Get base model for PEFT models
+        model_to_freeze = self._get_base_model()
+
         # Use existing find_layers function for consistency
-        linear_layers = find_layers(self.model)
+        linear_layers = find_layers(model_to_freeze)
         for name, module in linear_layers.items():
             if name in self.safety_masks:
                 mask = self.safety_masks[name]
-                
+
                 # Create a hook to zero out gradients for safety-critical neurons
                 def create_gradient_hook(mask):
                     def hook(grad):
@@ -207,15 +265,29 @@ class FineTuner:
                         grad[mask] = 0
                         return grad
                     return hook
-                
-                # Register the hook
+
+                # Register the hook on base model weights
                 if module.weight.requires_grad:
                     module.weight.register_hook(create_gradient_hook(mask))
-                
+
                 frozen_count += mask.sum().item()
                 total_count += mask.numel()
-        
+
         print(f"Frozen {frozen_count}/{total_count} safety-critical neurons ({100*frozen_count/total_count:.2f}%)")
+        if self.use_peft:
+            print("Note: LoRA adapters remain trainable (only base model neurons frozen)")
+        return self.model
+
+    def _get_base_model(self):
+        """
+        Get the base model, unwrapping PEFT if needed.
+
+        Returns:
+            Base model (unwrapped from PEFT if applicable)
+        """
+        if self.use_peft and hasattr(self.model, 'base_model'):
+            # PEFT model: access base model
+            return self.model.base_model.model
         return self.model
     
     def fine_tune_model(self,

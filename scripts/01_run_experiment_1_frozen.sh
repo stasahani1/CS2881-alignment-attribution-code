@@ -65,7 +65,13 @@ echo "----------------------------------------------------------------------"
 EVAL_FLAG=""
 if [ "${EVAL_ATTACK}" = "true" ]; then
     EVAL_FLAG="--eval_attack"
-    echo "Note: ASR evaluation will be performed after fine-tuning"
+fi
+
+# PEFT flags
+PEFT_FLAGS=""
+if [ "${USE_PEFT}" = "true" ]; then
+    PEFT_FLAGS="--use_peft --peft_r ${PEFT_R:-8} --peft_alpha ${PEFT_ALPHA:-16} --peft_target_modules ${PEFT_TARGET_MODULES:-q_proj,v_proj}"
+    echo "Note: Using PEFT (LoRA) fine-tuning with r=${PEFT_R:-8}"
 fi
 
 uv run python main_extension.py \
@@ -85,6 +91,7 @@ uv run python main_extension.py \
     --device ${DEVICE} \
     --model_save_path ${MODEL_SAVE_PATH} \
     --results_path ${EXP_DIR} \
+    ${PEFT_FLAGS} \
     ${EVAL_FLAG}
 
 echo ""

@@ -144,6 +144,31 @@ def main():
         help="Maximum sequence length"
     )
 
+    # PEFT/LoRA arguments
+    parser.add_argument(
+        "--use_peft",
+        action="store_true",
+        help="Enable PEFT (LoRA) fine-tuning"
+    )
+    parser.add_argument(
+        "--peft_r",
+        type=int,
+        default=8,
+        help="LoRA rank (default: 8)"
+    )
+    parser.add_argument(
+        "--peft_alpha",
+        type=int,
+        default=16,
+        help="LoRA alpha scaling factor (default: 16)"
+    )
+    parser.add_argument(
+        "--peft_target_modules",
+        type=str,
+        default="q_proj,v_proj",
+        help="Comma-separated list of modules to apply LoRA to (default: q_proj,v_proj)"
+    )
+
     # Evaluation arguments
     parser.add_argument(
         "--original_safety_masks_path",
@@ -323,9 +348,18 @@ def main():
         safety_masks = torch.load(args.safety_masks)
 
         # Fine-tune the model with frozen safety neurons
-        fine_tuner = FineTuner(model, tokenizer, device, safety_masks)
+        fine_tuner = FineTuner(
+            model, tokenizer, device, safety_masks,
+            use_peft=args.use_peft,
+            peft_r=args.peft_r,
+            peft_alpha=args.peft_alpha,
+            peft_target_modules=args.peft_target_modules
+        )
 
-        print("\nFine-tuning model with frozen safety-critical neurons...")
+        if args.use_peft:
+            print("\nUsing PEFT (LoRA) fine-tuning with frozen safety-critical neurons...")
+        else:
+            print("\nFine-tuning model with frozen safety-critical neurons...")
         fine_tuned_model = fine_tuner.fine_tune_model(
             training_data=args.training_data,
             num_epochs=args.num_epochs,

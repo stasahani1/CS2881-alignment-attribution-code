@@ -24,7 +24,7 @@ EVAL_ATTACK="${EVAL_ATTACK:-false}"
 RESULTS_BASE="./results/${MODEL}"
 NEURON_DIR="${RESULTS_BASE}/neuron_identification"
 EXP_DIR="${RESULTS_BASE}/experiment_2_unfrozen"
-MODEL_SAVE_PATH="/tmp/fine_tuned_models/${MODEL}/experiment_2_unfrozen"
+MODEL_SAVE_PATH="/dev/shm/fine_tuned_models/${MODEL}/experiment_2_unfrozen"
 
 # ============================================================================
 # Verify Prerequisites

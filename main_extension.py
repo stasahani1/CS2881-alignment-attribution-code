@@ -15,8 +15,8 @@ import argparse
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Set HuggingFace cache to /tmp/ to avoid filling workspace storage
-os.environ["HF_HOME"] = "/tmp/huggingface"
+# Set HuggingFace cache to /dev/shm (117GB) to avoid filling workspace or /tmp
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
 
 from main import modeltype2path, get_llm
 from lib.extension_utils import (
@@ -191,8 +191,8 @@ def main():
     parser.add_argument(
         "--model_save_path",
         type=str,
-        default="/tmp/fine_tuned_model",
-        help="Path to save fine-tuned model"
+        default="/dev/shm/fine_tuned_model",
+        help="Path to save fine-tuned model (default: /dev/shm for large storage)"
     )
     parser.add_argument(
         "--results_path",

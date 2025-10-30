@@ -1,10 +1,13 @@
 import argparse
-import os 
+import os
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 from vllm import LLM
+
+# Set HuggingFace cache to /dev/shm (117GB) to avoid filling workspace or /tmp
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
 
 from lib.eval import eval_ppl, eval_zero_shot, eval_attack
 from lib.prune import check_sparsity
@@ -14,7 +17,7 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
-SAVE_PATH = './ckpts' # path to save rewinded model temporarily (for VLLM)
+SAVE_PATH = '/dev/shm/ckpts' # path to save rewinded model temporarily (for VLLM)
 
 modeltype2path = {
     # Fine-tuning related models

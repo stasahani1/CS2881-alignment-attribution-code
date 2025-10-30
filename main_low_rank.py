@@ -6,6 +6,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 from vllm import LLM
 
+# Set HuggingFace cache to /dev/shm (117GB) to avoid filling workspace or /tmp
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
+
 from lib.prune import (
     prune_wanda,
     prune_random,
@@ -27,13 +30,13 @@ print("transformers", version("transformers"))
 print("accelerate", version("accelerate"))
 print("# of gpus: ", torch.cuda.device_count())
 
-SAVE_PATH = "temp"
+SAVE_PATH = "/dev/shm/pruned_models"
 
 modeltype2path = {
-    "llama2-7b-chat-hf": "",
-    "llama2-13b-chat-hf": "",
-    "llama2-7b-hf": "",
-    "llama2-13b-hf": "",
+    "llama2-7b-chat-hf": "meta-llama/Llama-2-7b-chat-hf",
+    "llama2-13b-chat-hf": "meta-llama/Llama-2-13b-chat-hf",
+    "llama2-7b-hf": "meta-llama/Llama-2-7b-hf",
+    "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
 }
 
 
@@ -44,13 +47,14 @@ def get_llm(model_name, cache_dir="llm_weights"):
         "llama2-7b-hf",
         "llama2-13b-hf",
     ]:
+        # Load model without device_map to avoid accelerate issues
         model = AutoModelForCausalLM.from_pretrained(
             modeltype2path[model_name],
             torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
             low_cpu_mem_usage=True,
-            device_map="auto",
         )
+        # Move to GPU manually
+        model = model.to('cuda:0')
 
     model.seqlen = model.config.max_position_embeddings
     return model

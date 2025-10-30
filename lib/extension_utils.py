@@ -218,13 +218,13 @@ class FineTuner:
         print(f"Frozen {frozen_count}/{total_count} safety-critical neurons ({100*frozen_count/total_count:.2f}%)")
         return self.model
     
-    def fine_tune_model(self, 
+    def fine_tune_model(self,
                        training_data: str = "alpaca_cleaned_no_safety",
                        num_epochs: int = 3,
                        learning_rate: float = 2e-5,
                        batch_size: int = 4,
                        max_length: int = 2048,
-                       model_save_path: str = "./models/fine_tuned_model") -> nn.Module:
+                       model_save_path: str = "/dev/shm/fine_tuned_model") -> nn.Module:
         """
         Fine-tune the model while keeping safety-critical neurons frozen.
         

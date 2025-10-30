@@ -6,8 +6,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 from vllm import LLM
 
-# Set HuggingFace cache to /tmp/ to avoid filling workspace storage
-os.environ["HF_HOME"] = "/tmp/huggingface"
+# Set HuggingFace cache to /dev/shm (117GB) to avoid filling workspace or /tmp
+os.environ["HF_HOME"] = "/dev/shm/huggingface"
 
 from lib.prune import (
     prune_wanda,
@@ -35,10 +35,10 @@ print("# of gpus: ", torch.cuda.device_count())
 SAVE_PATH = "/dev/shm/pruned_models"  # Use shared memory to avoid /workspace quota
 
 modeltype2path = {
-    "llama2-7b-chat-hf": os.path.abspath("models/llama-2-7b-chat-hf/"),
-    "llama2-13b-chat-hf": "",
-    "llama2-7b-hf": "",
-    "llama2-13b-hf": "",
+    "llama2-7b-chat-hf": "meta-llama/Llama-2-7b-chat-hf",
+    "llama2-13b-chat-hf": "meta-llama/Llama-2-13b-chat-hf",
+    "llama2-7b-hf": "meta-llama/Llama-2-7b-hf",
+    "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
 }
 
 
@@ -49,18 +49,18 @@ def get_llm(model_name, cache_dir="llm_weights"):
         "llama2-7b-hf",
         "llama2-13b-hf",
     ]:
+        # Load model directly to cuda instead of using device_map="auto"
+        # This avoids accelerate's get_max_memory() which fails in some environments
         model = AutoModelForCausalLM.from_pretrained(
-            modeltype2path[model_name],
+            modeltype2path[model_name],  # Use HuggingFace model name, not path
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
-            device_map="auto",
             use_safetensors=False,  # Use .bin files only
-            local_files_only=True,   # Force local loading
-            # Disable all caching
-            cache_dir=None,
-            force_download=False,
-            resume_download=False,
+            local_files_only=True,   # Use cached files (in /dev/shm/huggingface/)
+            # cache_dir is set via HF_HOME environment variable
         )
+        # Move to GPU manually
+        model = model.to('cuda:0')
 
     model.seqlen = model.config.max_position_embeddings
     return model

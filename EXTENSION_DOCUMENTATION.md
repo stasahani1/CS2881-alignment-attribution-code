@@ -288,7 +288,7 @@ uv run python main_extension.py \
 - `--eval_attack`: Flag to run ASR evaluation using `eval_attack()` from base codebase
 
 ### Output Arguments
-- `--model_save_path`: Path to save fine-tuned model (default: `./fine_tuned_model`)
+- `--model_save_path`: Path to save fine-tuned model (default: `/dev/shm/fine_tuned_model` - uses shared memory for 117GB storage)
 - `--results_path`: Path to save analysis results (default: `./results`)
 
 ### Other Arguments

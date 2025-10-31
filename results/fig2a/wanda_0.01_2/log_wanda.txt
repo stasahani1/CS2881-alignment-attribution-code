@@ -1,0 +1,4 @@
+method	actual_sparsity	metric	score
+wanda	0.009818	PPL	75179.0469
+wanda	0.009818	PPL	75179.0469
+wanda	0.009818	PPL	75179.0469

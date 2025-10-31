@@ -346,8 +346,6 @@ def _prune_core(
             else:
                 i = 0
 
-            print("layer", i)
-
             if model_base is not None:
                 module_base = model_base.get_submodule(name)
 

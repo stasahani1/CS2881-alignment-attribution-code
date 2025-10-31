@@ -38,7 +38,6 @@ modeltype2path = {
     "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
 }
 
-
 def get_llm(model_name, cache_dir="llm_weights"):
     if model_name in [
         "llama2-7b-chat-hf",
@@ -46,16 +45,40 @@ def get_llm(model_name, cache_dir="llm_weights"):
         "llama2-7b-hf",
         "llama2-13b-hf",
     ]:
+        # Load model directly to cuda instead of using device_map="auto"
+        # This avoids accelerate's get_max_memory() which fails in some environments
         model = AutoModelForCausalLM.from_pretrained(
-            modeltype2path[model_name],
+            modeltype2path[model_name],  # Use HuggingFace model name, not path
             torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
             low_cpu_mem_usage=True,
-            device_map="auto",
+            use_safetensors=False,  # Use .bin files only
+            local_files_only=True,   # Use cached files (in /dev/shm/huggingface/)
+            cache_dir="/dev/shm/huggingface/hub",  # Explicitly set cache directory
         )
+        # Move to GPU manually
+        model = model.to('cuda:0')
 
     model.seqlen = model.config.max_position_embeddings
     return model
+
+
+# def get_llm(model_name, cache_dir="llm_weights"):
+#     if model_name in [
+#         "llama2-7b-chat-hf",
+#         "llama2-13b-chat-hf",
+#         "llama2-7b-hf",
+#         "llama2-13b-hf",
+#     ]:
+#         model = AutoModelForCausalLM.from_pretrained(
+#             modeltype2path[model_name],
+#             torch_dtype=torch.bfloat16,
+#             cache_dir=cache_dir,
+#             low_cpu_mem_usage=True,
+#             device_map="auto",
+#         )
+
+#     model.seqlen = model.config.max_position_embeddings
+#     return model
 
 
 def main():

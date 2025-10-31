@@ -6,6 +6,7 @@ set -e  # Exit on error
 
 # Configuration
 MODEL="llama2-7b-chat-hf"
+CACHE_DIR="models/llama-2-7b-chat-hf"  # Use pre-downloaded models
 METHOD="wandg"  # SNIP method
 SPARSITY_RATIO=0.01  # Not used for scoring, but required parameter
 NSAMPLES=128  # Number of calibration samples
@@ -32,6 +33,7 @@ echo "Step 1/2: Computing SNIP scores on safety dataset (align)..."
 echo "Output: ${SAFETY_SCORE_DIR}"
 python main.py \
     --model "${MODEL}" \
+    --cache_dir "${CACHE_DIR}" \
     --prune_method "${METHOD}" \
     --prune_data align \
     --sparsity_ratio "${SPARSITY_RATIO}" \
@@ -45,6 +47,7 @@ echo "Step 2/2: Computing SNIP scores on utility dataset (alpaca_cleaned_no_safe
 echo "Output: ${UTILITY_SCORE_DIR}"
 python main.py \
     --model "${MODEL}" \
+    --cache_dir "${CACHE_DIR}" \
     --prune_method "${METHOD}" \
     --prune_data alpaca_cleaned_no_safety \
     --sparsity_ratio "${SPARSITY_RATIO}" \

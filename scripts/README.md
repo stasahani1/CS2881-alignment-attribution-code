@@ -14,7 +14,7 @@ See which experiments have already been completed.
 ```bash
 ./scripts/quick_test.sh
 ```
-Runs the full pipeline with minimal settings (~30-60 min) to verify everything works.
+Runs Experiment 2 with minimal settings (~30-60 min) to sanity-check the setup.
 
 ### 2. Full Pipeline (Single Model)
 ```bash

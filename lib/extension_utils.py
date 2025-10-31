@@ -1,6 +1,10 @@
+import os
+import shutil
+import uuid
+from typing import Callable, Dict, Optional
+
 import torch
 import torch.nn as nn
-from typing import Dict
 from datasets import Dataset
 from transformers import DataCollatorForLanguageModeling
 from transformers import TrainingArguments, Trainer
@@ -8,8 +12,259 @@ from vllm import LLM
 
 from .data import get_loaders
 from .prune import check_sparsity, find_layers
-from .model_wrapper import make_Act, revert_Act_to_Linear, ActLinear, no_act_recording
+from .model_wrapper import (
+    ActLinear,
+    clear_act_buffer,
+    make_Act,
+    revert_Act_to_Linear,
+    set_mask,
+    no_act_recording,
+)
 from .eval import eval_attack
+
+
+def _sanitize_module_name(name: str) -> str:
+    return name.replace(".", "_")
+
+
+def _build_mask_from_indices(shape, indices: torch.Tensor) -> torch.Tensor:
+    mask = torch.zeros(shape, dtype=torch.bool)
+    if indices.numel() > 0:
+        mask.view(-1)[indices] = True
+    return mask
+
+
+def _collect_layer_scores(
+    model,
+    tokenizer,
+    prune_method: str,
+    prune_data: str,
+    nsamples: int,
+    seed: int,
+    device: torch.device,
+    layer_callback: Callable[[int, str, torch.Tensor], None],
+):
+    """
+    Iterate over model layers and provide Wanda/SNIP scores to a callback without pruning.
+    """
+    if prune_method not in {"wanda", "wandg"}:
+        raise ValueError(f"Unsupported prune method for score dump: {prune_method}")
+
+    score_model = make_Act(model, verbose=False)
+    score_model.to(device)
+    score_model.eval()
+
+    dataloader, _ = get_loaders(
+        prune_data,
+        nsamples=nsamples,
+        seed=seed,
+        seqlen=score_model.seqlen,
+        tokenizer=tokenizer,
+        disentangle=True,
+    )
+    if dataloader is None:
+        raise ValueError(f"Unable to load dataset {prune_data} for score computation.")
+
+    # Ensure deterministic iteration order
+    batches = list(dataloader)
+
+    if prune_method == "wanda":
+        # Populate activation statistics once
+        clear_act_buffer(score_model)
+        with torch.no_grad():
+            for inp, tar in batches:
+                inp = inp.to(device)
+                tar = tar.to(device)
+                mask = None
+                try:
+                    mask = tar.ne(-100)
+                except RuntimeError:
+                    mask = None
+                if mask is not None:
+                    with set_mask(score_model, mask):
+                        score_model(input_ids=inp)
+                else:
+                    score_model(input_ids=inp)
+
+    num_layers = score_model.config.num_hidden_layers
+
+    for layer_idx in range(num_layers):
+        layer_prefix = f"model.layers.{layer_idx}."
+        target_modules = [
+            (name, module)
+            for name, module in score_model.named_modules()
+            if name.startswith(layer_prefix) and isinstance(module, ActLinear)
+        ]
+        if not target_modules:
+            continue
+
+        if prune_method == "wandg":
+            score_model.train()
+            score_model.zero_grad()
+            score_model.requires_grad_(False)
+            for _, module in target_modules:
+                module.base.requires_grad_(True)
+                if module.base.weight.grad is not None:
+                    module.base.weight.grad.zero_()
+
+            for inp, tar in batches:
+                inp = inp.to(device)
+                tar = tar.to(device)
+                score_model.zero_grad(set_to_none=True)
+                outputs = score_model(input_ids=inp, labels=tar)
+                loss = (
+                    outputs[0]
+                    if isinstance(outputs, (tuple, list))
+                    else getattr(outputs, "loss", outputs)
+                )
+                loss.backward()
+
+            for name, module in target_modules:
+                grad = module.base.weight.grad.detach().abs().cpu()
+                layer_callback(layer_idx, name, grad)
+                module.base.requires_grad_(False)
+                module.base.weight.grad = None
+        else:
+            score_model.eval()
+            for name, module in target_modules:
+                weight = module.base.weight.data.detach().abs().cpu()
+                act = torch.sqrt(
+                    module.activation_norms.detach().cpu().reshape((1, -1)) + 1e-12
+                )
+                layer_callback(layer_idx, name, weight * act)
+
+        torch.cuda.empty_cache()
+
+    score_model = revert_Act_to_Linear(score_model)
+    score_model.to(device)
+    score_model.train()
+    torch.cuda.empty_cache()
+
+
+def _dump_scores_to_disk(
+    model,
+    tokenizer,
+    prune_method: str,
+    prune_data: str,
+    nsamples: int,
+    seed: int,
+    device: torch.device,
+    target_dir: str,
+    dtype: torch.dtype = torch.float16,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    os.makedirs(target_dir, exist_ok=True)
+    saved: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def _save_callback(layer_idx: int, name: str, scores: torch.Tensor):
+        scores_to_save = scores.to(dtype)
+        file_name = f"layer{layer_idx:03d}__{_sanitize_module_name(name)}.pt"
+        path = os.path.join(target_dir, file_name)
+        torch.save({"scores": scores_to_save}, path)
+        saved[name] = {
+            "path": path,
+            "shape": scores.shape,
+            "layer_idx": layer_idx,
+        }
+
+    _collect_layer_scores(
+        model=model,
+        tokenizer=tokenizer,
+        prune_method=prune_method,
+        prune_data=prune_data,
+        nsamples=nsamples,
+        seed=seed,
+        device=device,
+        layer_callback=_save_callback,
+    )
+    torch.cuda.empty_cache()
+    return saved
+
+
+def _select_topk_from_dump(
+    score_files: Dict[str, Dict[str, torch.Tensor]],
+    fraction: float,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    results: Dict[str, Dict[str, torch.Tensor]] = {}
+    for name, info in score_files.items():
+        shape = info["shape"]
+        numel = int(shape[0] * shape[1])
+        k = int(numel * fraction)
+        if fraction > 0 and k == 0 and numel > 0:
+            k = 1  # ensure at least one entry when fraction>0
+
+        if k <= 0 or numel == 0:
+            results[name] = {
+                "indices": torch.empty(0, dtype=torch.int32),
+                "scores": torch.empty(0, dtype=torch.float32),
+                "shape": shape,
+            }
+            continue
+
+        payload = torch.load(info["path"], map_location="cpu")
+        scores = payload["scores"].to(torch.float32)
+        flat = scores.view(-1)
+        k = min(k, flat.numel())
+        values, indices = torch.topk(flat, k, largest=True)
+        results[name] = {
+            "indices": indices.to(torch.int32).cpu(),
+            "scores": values.to(torch.float32).cpu(),
+            "shape": shape,
+        }
+        del scores, flat, values, indices, payload
+        torch.cuda.empty_cache()
+    return results
+
+
+def _compute_set_difference(
+    utility_top: Dict[str, Dict[str, torch.Tensor]],
+    safety_top: Dict[str, Dict[str, torch.Tensor]],
+    keep_safety_scores: bool,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    safety_masks: Dict[str, torch.Tensor] = {}
+    safety_scores: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    for name, safety_info in safety_top.items():
+        shape = safety_info["shape"]
+        q_indices = safety_info["indices"].to(torch.int64)
+        q_scores = safety_info["scores"]
+        utility_info = utility_top.get(name)
+        if utility_info is None:
+            p_indices = torch.empty(0, dtype=torch.int64)
+        else:
+            p_indices = utility_info["indices"].to(torch.int64)
+
+        if q_indices.numel() == 0:
+            mask = torch.zeros(shape, dtype=torch.bool)
+            safety_masks[name] = mask
+            safety_scores[name] = {
+                "indices": torch.empty(0, dtype=torch.int32),
+                "scores": torch.empty(0, dtype=torch.float32),
+                "shape": shape,
+            }
+            continue
+
+        if p_indices.numel() == 0:
+            filtered_indices = q_indices
+            selection_mask = torch.ones_like(q_indices, dtype=torch.bool)
+        else:
+            selection_mask = ~torch.isin(q_indices, p_indices)
+            filtered_indices = q_indices[selection_mask]
+
+        mask = _build_mask_from_indices(shape, filtered_indices.to(torch.int64))
+        safety_masks[name] = mask
+
+        if keep_safety_scores:
+            filtered_scores = q_scores[selection_mask].to(torch.float32)
+        else:
+            filtered_scores = torch.empty(0, dtype=torch.float32)
+
+        safety_scores[name] = {
+            "indices": filtered_indices.to(torch.int32),
+            "scores": filtered_scores.cpu(),
+            "shape": shape,
+        }
+
+    return safety_masks, safety_scores
 
 class SafetyNeuronAnalyzer:
     """
@@ -23,6 +278,7 @@ class SafetyNeuronAnalyzer:
         self.safety_critical_neurons = {}
         self.safety_critical_scores = {}
         self.original_weights = {}
+        self.last_selection_metadata: Dict[str, Dict] = {}
         
     def identify_safety_critical_neurons(self,
                                       prune_method: str = "wandg",
@@ -51,6 +307,7 @@ class SafetyNeuronAnalyzer:
 
         # Clear GPU cache before starting
         torch.cuda.empty_cache()
+        self.last_selection_metadata = {}
 
         # Get base model if PEFT-wrapped
         model_to_score = self._unwrap_peft_model(self.model)
@@ -165,6 +422,139 @@ class SafetyNeuronAnalyzer:
         self.safety_critical_neurons = safety_masks
         self.safety_critical_scores = safety_scores
         return safety_masks, safety_scores
+
+    def identify_safety_neurons_set_difference(
+        self,
+        prune_method: str,
+        safety_prune_data: str,
+        utility_prune_data: str,
+        p: float,
+        q: float,
+        nsamples: int,
+        seed: int,
+        score_tmp_root: str = "/dev/shm/wanda_scores",
+        cleanup_tmp: bool = True,
+        keep_safety_scores: bool = True,
+        score_dtype: torch.dtype = torch.float16,
+        return_component: str = "difference",
+    ):
+        """
+        Identify safety-critical neurons via the set-difference method described in the paper.
+
+        Args:
+            prune_method: "wanda" or "wandg"
+            safety_prune_data: Dataset used to score safety importance (e.g., align, align_short)
+            utility_prune_data: Dataset used to score utility importance (e.g., alpaca_cleaned_no_safety)
+            p: Fraction for top utility neurons
+            q: Fraction for top safety neurons
+            nsamples: Number of samples
+            seed: Random seed
+            score_tmp_root: Directory for temporary score dumps
+            cleanup_tmp: Remove temporary dumps after processing
+            keep_safety_scores: Whether to retain safety scores for the selected neurons
+            score_dtype: dtype for intermediate score storage
+        """
+        if prune_method not in {"wanda", "wandg"}:
+            raise ValueError("Set difference currently supports 'wanda' and 'wandg'.")
+        if not 0 <= p <= 1 or not 0 <= q <= 1:
+            raise ValueError("p and q must be within [0, 1].")
+
+        self.model.to(self.device)
+        os.makedirs(score_tmp_root, exist_ok=True)
+        run_dir = os.path.join(score_tmp_root, f"setdiff_{uuid.uuid4().hex}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        print("Dumping utility scores...")
+        utility_dir = os.path.join(run_dir, f"{prune_method}_{utility_prune_data}")
+        utility_dump = _dump_scores_to_disk(
+            model=self._unwrap_peft_model(self.model),
+            tokenizer=self.tokenizer,
+            prune_method=prune_method,
+            prune_data=utility_prune_data,
+            nsamples=nsamples,
+            seed=seed,
+            device=self.device,
+            target_dir=utility_dir,
+            dtype=score_dtype,
+        )
+
+        print("Dumping safety scores...")
+        safety_dir = os.path.join(run_dir, f"{prune_method}_{safety_prune_data}")
+        safety_dump = _dump_scores_to_disk(
+            model=self._unwrap_peft_model(self.model),
+            tokenizer=self.tokenizer,
+            prune_method=prune_method,
+            prune_data=safety_prune_data,
+            nsamples=nsamples,
+            seed=seed,
+            device=self.device,
+            target_dir=safety_dir,
+            dtype=score_dtype,
+        )
+
+        print("Selecting top-p utility and top-q safety neurons...")
+        utility_top = _select_topk_from_dump(utility_dump, p)
+        safety_top = _select_topk_from_dump(safety_dump, q)
+
+        print("Computing set difference (safety \\ utility)...")
+        safety_masks, safety_scores = _compute_set_difference(
+            utility_top=utility_top,
+            safety_top=safety_top,
+            keep_safety_scores=keep_safety_scores,
+        )
+
+        utility_masks = {
+            name: _build_mask_from_indices(info["shape"], info["indices"].to(torch.int64))
+            for name, info in utility_top.items()
+        }
+        safety_top_masks = {
+            name: _build_mask_from_indices(info["shape"], info["indices"].to(torch.int64))
+            for name, info in safety_top.items()
+        }
+
+        metadata = {
+            "strategy": "set_difference",
+            "prune_method": prune_method,
+            "utility_prune_data": utility_prune_data,
+            "safety_prune_data": safety_prune_data,
+            "p": p,
+            "q": q,
+            "nsamples": nsamples,
+            "seed": seed,
+            "score_dtype": str(score_dtype),
+            "utility_top": utility_top,
+            "utility_top_masks": utility_masks,
+            "safety_top": safety_top,
+            "safety_top_masks": safety_top_masks,
+        }
+
+        if cleanup_tmp:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            metadata["tmp_scores_dir"] = None
+        else:
+            metadata["tmp_scores_dir"] = run_dir
+
+        component = return_component.lower()
+        if component == "difference":
+            selected_masks = safety_masks
+            selected_scores = safety_scores
+        elif component == "utility_top":
+            selected_masks = utility_masks
+            selected_scores = utility_top
+        elif component == "safety_top":
+            selected_masks = safety_top_masks
+            selected_scores = safety_top
+        else:
+            raise ValueError(
+                "return_component must be one of {'difference', 'utility_top', 'safety_top'}"
+            )
+
+        metadata["returned_component"] = component
+
+        self.last_selection_metadata = metadata
+        self.safety_critical_neurons = selected_masks
+        self.safety_critical_scores = selected_scores
+        return selected_masks, selected_scores
 
     def _unwrap_peft_model(self, model):
         """

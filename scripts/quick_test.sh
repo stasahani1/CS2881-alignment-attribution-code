@@ -1,38 +1,23 @@
 #!/bin/bash
-################################################################################
-# Quick test with minimal resources to verify pipeline works
-# Expected runtime: ~30-60 minutes
-################################################################################
+set -euo pipefail
 
-set -e  # Exit on error
+echo "Quick test: Experiment 2 (set-diff IDs, 1 epoch)"
+read -p "Press Enter to continue or Ctrl+C to abort... "
 
-echo "======================================================================"
-echo "QUICK TEST - Experiment 1 Only"
-echo "======================================================================"
-echo "Settings: 1% neurons, 32 samples, 1 epoch, no ASR"
-echo "Expected: 30-60 minutes"
-read -p "Press Enter to start, or Ctrl+C to cancel..."
-echo ""
-
-# Quick test configuration
-export MODEL="llama2-7b-chat-hf"
-export PRUNE_METHOD="wanda"
-export SPARSITY_RATIO="0.01"
-export TRAINING_DATA="alpaca_cleaned_no_safety"
-export NUM_EPOCHS="1"
-export LEARNING_RATE="2e-5"
-export BATCH_SIZE="2"
-export MAX_LENGTH="256"
-export NSAMPLES="32"
-export SEED="42"
-export DEVICE="cuda:0"
+export MODEL="${MODEL:-llama2-7b-chat-hf}"
+export PRUNE_METHOD="${PRUNE_METHOD:-wanda}"
+export SPARSITY_RATIO="${SPARSITY_RATIO:-0.01}"
+export TOP_P="${TOP_P:-${SPARSITY_RATIO}}"
+export TOP_Q="${TOP_Q:-${SPARSITY_RATIO}}"
+export NSAMPLES="${NSAMPLES:-32}"
+export NUM_EPOCHS="${NUM_EPOCHS:-1}"
+export BATCH_SIZE="${BATCH_SIZE:-2}"
+export MAX_LENGTH="${MAX_LENGTH:-256}"
+export LEARNING_RATE="${LEARNING_RATE:-2e-5}"
+export TRAINING_DATA="${TRAINING_DATA:-alpaca_cleaned_no_safety}"
 export EVAL_ATTACK="false"
 
-# Run neuron identification + Experiment 1 only
 ./scripts/00_setup_neuron_identification.sh
-./scripts/01_run_experiment_1_frozen.sh
+./scripts/02_run_experiment_2_unfrozen.sh
 
-echo ""
-echo "✓ Quick test complete! Check ./results/${MODEL}/experiment_1_frozen/"
-echo ""
-echo "To run full experiments: ./scripts/run_full_pipeline.sh"
+echo "Quick test complete → ./results/${MODEL}/experiment_2_unfrozen/"

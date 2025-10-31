@@ -99,6 +99,54 @@ def main():
         default=128,
         help="Number of samples for scoring"
     )
+    parser.add_argument(
+        "--selection_strategy",
+        type=str,
+        default="topk",
+        choices=["topk", "set_difference"],
+        help="Neuron selection strategy (topk or set_difference)"
+    )
+    parser.add_argument(
+        "--utility_prune_data",
+        type=str,
+        default="alpaca_cleaned_no_safety",
+        help="Dataset used for utility scoring when using set difference"
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.1,
+        help="Top-p fraction (utility) for set difference"
+    )
+    parser.add_argument(
+        "--top_q",
+        type=float,
+        default=None,
+        help="Top-q fraction (safety) for set difference (defaults to sparsity_ratio)"
+    )
+    parser.add_argument(
+        "--score_tmp_dir",
+        type=str,
+        default="/dev/shm/wanda_scores",
+        help="Temporary directory for storing full score tensors"
+    )
+    parser.add_argument(
+        "--keep_tmp_scores",
+        action="store_true",
+        help="Keep temporary score dumps instead of deleting them"
+    )
+    parser.add_argument(
+        "--drop_safety_scores",
+        action="store_true",
+        help="Drop safety score magnitudes after selection (store neuron IDs only)"
+    )
+    parser.add_argument(
+        "--score_dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "float32"],
+        help="Data type used when persisting temporary score tensors"
+    )
 
     # Fine-tuning arguments
     parser.add_argument(
@@ -264,13 +312,30 @@ def main():
 
         # Identify safety-critical neurons
         analyzer = SafetyNeuronAnalyzer(model, tokenizer, device)
-        safety_masks, safety_scores = analyzer.identify_safety_critical_neurons(
-            prune_method=args.prune_method,
-            prune_data=args.prune_data,
-            sparsity_ratio=args.sparsity_ratio,
-            nsamples=args.nsamples,
-            seed=args.seed,
-        )
+        score_dtype = torch.float16 if args.score_dtype == "float16" else torch.float32
+        if args.selection_strategy == "set_difference":
+            top_q = args.top_q if args.top_q is not None else args.sparsity_ratio
+            safety_masks, safety_scores = analyzer.identify_safety_neurons_set_difference(
+                prune_method=args.prune_method,
+                safety_prune_data=args.prune_data,
+                utility_prune_data=args.utility_prune_data,
+                p=args.top_p,
+                q=top_q,
+                nsamples=args.nsamples,
+                seed=args.seed,
+                score_tmp_root=args.score_tmp_dir,
+                cleanup_tmp=not args.keep_tmp_scores,
+                keep_safety_scores=not args.drop_safety_scores,
+                score_dtype=score_dtype,
+            )
+        else:
+            safety_masks, safety_scores = analyzer.identify_safety_critical_neurons(
+                prune_method=args.prune_method,
+                prune_data=args.prune_data,
+                sparsity_ratio=args.sparsity_ratio,
+                nsamples=args.nsamples,
+                seed=args.seed,
+            )
 
         # Save results
         save_dir = os.path.join(args.results_path, "safety_neurons")
@@ -278,6 +343,13 @@ def main():
 
         torch.save(safety_masks, os.path.join(save_dir, "original_safety_masks.pt"))
         torch.save(safety_scores, os.path.join(save_dir, "original_safety_scores.pt"))
+
+        if args.selection_strategy == "set_difference":
+            metadata = analyzer.last_selection_metadata or {}
+            torch.save(
+                metadata,
+                os.path.join(save_dir, "set_difference_metadata.pt"),
+            )
 
         print(f"\nSaved safety neuron data to {save_dir}")
 
@@ -303,13 +375,31 @@ def main():
 
         # Identify utility-critical neurons using utility dataset
         analyzer = SafetyNeuronAnalyzer(model, tokenizer, device)
-        utility_masks, utility_scores = analyzer.identify_safety_critical_neurons(
-            prune_method=args.prune_method,
-            prune_data=args.prune_data,  # Should be "alpaca_cleaned_no_safety"
-            sparsity_ratio=args.sparsity_ratio,
-            nsamples=args.nsamples,
-            seed=args.seed,
-        )
+        score_dtype = torch.float16 if args.score_dtype == "float16" else torch.float32
+        if args.selection_strategy == "set_difference":
+            top_q = args.top_q if args.top_q is not None else args.sparsity_ratio
+            utility_masks, utility_scores = analyzer.identify_safety_neurons_set_difference(
+                prune_method=args.prune_method,
+                safety_prune_data=args.prune_data,
+                utility_prune_data=args.utility_prune_data,
+                p=args.top_p,
+                q=top_q,
+                nsamples=args.nsamples,
+                seed=args.seed,
+                score_tmp_root=args.score_tmp_dir,
+                cleanup_tmp=not args.keep_tmp_scores,
+                keep_safety_scores=not args.drop_safety_scores,
+                score_dtype=score_dtype,
+                return_component="utility_top",
+            )
+        else:
+            utility_masks, utility_scores = analyzer.identify_safety_critical_neurons(
+                prune_method=args.prune_method,
+                prune_data=args.prune_data,  # Should be "alpaca_cleaned_no_safety"
+                sparsity_ratio=args.sparsity_ratio,
+                nsamples=args.nsamples,
+                seed=args.seed,
+            )
 
         # Save results
         save_dir = os.path.join(args.results_path, "utility_neurons")
@@ -317,6 +407,13 @@ def main():
 
         torch.save(utility_masks, os.path.join(save_dir, "original_utility_masks.pt"))
         torch.save(utility_scores, os.path.join(save_dir, "original_utility_scores.pt"))
+
+        if args.selection_strategy == "set_difference":
+            metadata = analyzer.last_selection_metadata or {}
+            torch.save(
+                metadata,
+                os.path.join(save_dir, "set_difference_metadata.pt"),
+            )
 
         print(f"\nSaved utility neuron data to {save_dir}")
 

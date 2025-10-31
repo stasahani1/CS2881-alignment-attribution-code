@@ -56,6 +56,12 @@ Your RunPod container has three storage areas:
 - **Contents**: Wanda scores, masks, pruning results
 - **Why /workspace**: Small persistent results
 
+### Set-Difference Score Dumps
+- **Location**: `/dev/shm/wanda_scores/`
+- **Size**: Up to ~40GB per scoring pass (full Wanda/SNIP tensors in float16)
+- **Usage**: Temporary storage used by `main_extension.py --selection_strategy set_difference`
+- **Cleanup**: Automatically deleted unless `--keep_tmp_scores` is passed; manual cleanup with `rm -rf /dev/shm/wanda_scores/*`
+
 ## Disk Usage by Operation
 
 ### 1. Downloading Models (`download_hf_models.py`)

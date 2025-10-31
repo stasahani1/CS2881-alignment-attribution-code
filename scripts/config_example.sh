@@ -18,6 +18,9 @@ export NUM_EPOCHS="3"
 export LEARNING_RATE="2e-5"
 export BATCH_SIZE="4"
 export MAX_LENGTH="512"
+export TOP_P="0.05"
+export TOP_Q="0.05"
+export SCORE_TMP_DIR="/dev/shm/wanda_scores"
 
 # PEFT/LoRA Settings (optional)
 export USE_PEFT="false"           # Set to "true" to enable PEFT

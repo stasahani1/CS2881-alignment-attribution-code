@@ -4,25 +4,24 @@
 
 This extension implements experiments to understand **why safety alignment is brittle** in language models. Building on "Assessing the Brittleness of Safety Alignment via Pruning and Low-Rank Modifications," we investigate two complementary hypotheses about safety degradation during fine-tuning:
 
-1. **Frozen-Regime Fine-Tuning (Wanda Score Dynamics)**: How does the importance landscape shift when safety-critical neurons are frozen?
+1. **Frozen-Regime Fine-Tuning (Snip Score Dynamics)**: How does the importance landscape shift when safety-critical neurons are frozen?
 2. **Unfrozen Fine-Tuning (Safety Neuron Drift)**: How much do safety-critical neurons change compared to other neurons during normal fine-tuning?
 
 ## Research Questions
 
-### Experiment 1: Frozen-Regime Fine-Tuning (Wanda Score Dynamics)
+### Experiment 1: Frozen-Regime Fine-Tuning (Snip Score Dynamics)
 
-**Setup**: Freeze identified safety-critical neurons and fine-tune on harmless/utility datasets (e.g., Alpaca, harmless instructions). Then re-compute Wanda scores post-fine-tuning.
+**Setup**: Freeze identified safety-critical neurons and fine-tune on harmless/utility datasets (e.g., Alpaca, harmless instructions). Then re-compute Snip scores post-fine-tuning.
 
 **Goal**: Quantify whether the relative importance landscape shifts even though those neurons were frozen.
 
 **Hypotheses**:
-- **Hypothesis A (Representational Drift)**: If Wanda scores of frozen safety neurons drop sharply, it suggests representational drift elsewhere causes safety-relevant pathways to degrade. The frozen neurons become "stranded" as the model reorganizes around them.
-- **Hypothesis B (Stability Under Freezing)**: If their Wanda scores stay stable, brittleness might stem from global redistribution of function rather than direct parameter change. Safety persists locally but fails globally.
+- **Hypothesis A (Representational Drift)**: If Snip scores of frozen safety neurons drop sharply, it suggests representational drift elsewhere causes safety-relevant pathways to degrade. The frozen neurons become "stranded" as the model reorganizes around them.
+- **Hypothesis B (Stability Under Freezing)**: If their Snip scores stay stable, brittleness might stem from global redistribution of function rather than direct parameter change. Safety persists locally but fails globally.
 
 **Key Metrics**:
-- Wanda score distributions before/after (mean, std, top-k percentiles)
+- Snip score distributions before/after (mean, std, top-k percentiles)
 - Score drop percentage for frozen safety-critical neurons
-- Attack Success Rate (ASR) before/after fine-tuning
 
 ### Experiment 2: Unfrozen Fine-Tuning (Safety Neuron Drift)
 
@@ -38,7 +37,6 @@ This extension implements experiments to understand **why safety alignment is br
 - Cosine similarity between pre/post fine-tune weight vectors per neuron
 - L2 distance of weight changes
 - Comparison: safety-critical vs. random vs. utility-critical neurons
-- Attack Success Rate (ASR) before/after fine-tuning
 
 ## Architecture
 
@@ -50,7 +48,7 @@ The extension is organized into two main modules:
 ## Key Features
 
 ### 1. Safety-Critical Neuron Identification
-- **Wanda Scoring**: Magnitude-based scoring (`|w| × √(activation_norm)`) - primary method
+- **Snip Scoring**: Magnitude-based scoring (`|w| × √(activation_norm)`) - primary method
 - **SNIP (WandG) Scoring**: Gradient-based importance scoring (`|∇w|`) - alternative method
 - **Safety Dataset Support**: Works with aligned datasets (`align`, `align_short`) to identify safety-relevant neurons
 - **Utility-Critical Neuron Identification**: Also identifies utility-critical neurons using `alpaca_cleaned_no_safety`
@@ -60,7 +58,7 @@ The extension is organized into two main modules:
 - **Gradient Hooks**: Implements PyTorch hooks to zero out gradients for safety-critical neurons
 - **Selective Freezing**: Only freezes identified safety-critical neurons while allowing others to update
 - **Memory Efficient**: Preserves original model structure while preventing updates to critical neurons
-- **Wanda Score Tracking**: Re-computes Wanda scores post-fine-tuning to measure importance landscape shifts
+- **Snip Score Tracking**: Re-computes Snip scores post-fine-tuning to measure importance landscape shifts
 
 ### 3. Unfrozen Fine-Tuning with Drift Measurement
 - **Weight Snapshot**: Captures pre-fine-tuning weights for all neurons
@@ -70,7 +68,7 @@ The extension is organized into two main modules:
 
 ### 4. Evaluation and Analysis
 - **Attack Success Rate (ASR)**: Uses `eval_attack()` from base codebase to measure safety degradation
-- **Score Dynamics**: Tracks Wanda score changes for frozen safety neurons
+- **Score Dynamics**: Tracks Snip score changes for frozen safety neurons
 - **Weight Drift Analysis**: Quantifies parameter changes per neuron category
 - **Visualization Ready**: Exports data for plotting score distributions and drift comparisons
 
@@ -114,7 +112,7 @@ class ScoreDynamicsAnalyzer:
 ```
 
 **Key Methods:**
-- `compare_score_distributions()`: Statistical comparison of Wanda scores before/after fine-tuning
+- `compare_score_distributions()`: Statistical comparison of Snip scores before/after fine-tuning
 - `compute_score_drop_percentage()`: Measures how much frozen safety neurons' scores dropped
 
 ### Integration with Existing Codebase
@@ -153,18 +151,28 @@ See [scripts/README.md](scripts/README.md) for detailed script documentation.
 If you prefer to run commands manually or need fine-grained control:
 
 ### Experiment 1: Frozen-Regime Fine-Tuning (Score Dynamics)
-
+The mitigation run now identifies safety-critical neurons via the set-difference pipeline before any freezing.
 **Step 1: Identify safety-critical neurons**
 ```bash
 uv run python main_extension.py \
     --task identify_safety_neurons \
     --model llama2-7b-chat-hf \
-    --prune_method wanda \
+    --prune_method wandg \
+    --selection_strategy set_difference \
     --prune_data align_short \
-    --sparsity_ratio 0.05 \
+    --utility_prune_data alpaca_cleaned_no_safety \
+    --top_p 0.10 \
+    --top_q 0.10 \
     --nsamples 128 \
+    --score_tmp_dir /dev/shm/wanda_scores \
     --results_path ./results/frozen_regime
 ```
+This command:
+- Dumps the full SNIP scores for both datasets to `/dev/shm/wanda_scores/...`
+- Computes the top-p utility and top-q safety sets and forms the safety-only set difference
+- Stores the resulting masks/scores in `results/frozen_regime/safety_neurons/`
+- Persists all intermediate metadata (`set_difference_metadata.pt`) alongside the masks (contains the utility-only and safety-only tensors for downstream analysis)
+  - Switch `--prune_method` to `wanda` if you want the magnitude-based variant instead of SNIP.
 
 **Step 2: Fine-tune with frozen neurons**
 ```bash
@@ -195,27 +203,39 @@ uv run python main_extension.py \
 ```
 
 ### Experiment 2: Unfrozen Fine-Tuning (Weight Drift)
-
 **Step 1: Identify safety-critical and utility-critical neurons**
 ```bash
-# Identify safety-critical neurons
+# Identify safety-critical neurons (set difference safety\utility)
 uv run python main_extension.py \
     --task identify_safety_neurons \
     --model llama2-7b-chat-hf \
     --prune_method wanda \
+    --selection_strategy set_difference \
     --prune_data align_short \
-    --sparsity_ratio 0.05 \
+    --utility_prune_data alpaca_cleaned_no_safety \
+    --top_p 0.05 \
+    --top_q 0.05 \
+    --nsamples 128 \
+    --score_tmp_dir /dev/shm/wanda_scores \
+    --drop_safety_scores \
     --results_path ./results/unfrozen_regime
 
-# Identify utility-critical neurons
+# Extract utility-only neurons (top-p utility)
 uv run python main_extension.py \
     --task identify_utility_neurons \
     --model llama2-7b-chat-hf \
     --prune_method wanda \
+    --selection_strategy set_difference \
     --prune_data alpaca_cleaned_no_safety \
-    --sparsity_ratio 0.05 \
+    --utility_prune_data align_short \
+    --top_p 0.05 \
+    --top_q 0.05 \
+    --nsamples 128 \
+    --score_tmp_dir /dev/shm/wanda_scores \
+    --drop_safety_scores \
     --results_path ./results/unfrozen_regime
 ```
+- The safety command writes both the set-difference masks and a `set_difference_metadata.pt` file containing the full safety/utility index lists. Run the utility command if you prefer dedicated files under `utility_neurons/`.
 
 **Step 2: Fine-tune without freezing (capture weight drift)**
 ```bash

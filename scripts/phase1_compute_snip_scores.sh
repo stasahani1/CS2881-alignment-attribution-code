@@ -13,8 +13,9 @@ NSAMPLES=128  # Number of calibration samples
 SEED=0
 
 # Output directories (using /dev/shm for large temporary files)
-SCORE_BASE_DIR="/dev/shm/snip_scores"
-SAFETY_SCORE_DIR="${SCORE_BASE_DIR}/align"
+# SCORE_BASE_DIR="/dev/shm/snip_scores"
+SCORE_BASE_DIR="outputs/snip_scores"
+SAFETY_SCORE_DIR="${SCORE_BASE_DIR}/align_short"
 UTILITY_SCORE_DIR="${SCORE_BASE_DIR}/alpaca_cleaned_no_safety"
 
 echo "================================================"

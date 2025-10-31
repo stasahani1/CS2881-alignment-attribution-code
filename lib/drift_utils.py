@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 
 
@@ -38,6 +39,20 @@ def load_neuron_groups(neuron_groups_dir: str) -> Dict[str, Dict]:
         else:
             print(f"Warning: {filepath} not found, skipping {group_name}")
 
+    # Validate that at least one group was loaded
+    if not groups:
+        raise ValueError(
+            f"No neuron groups loaded from {neuron_groups_dir}! "
+            f"Make sure you've run phase 1 (identify_neuron_groups.py) first."
+        )
+
+    # Validate that groups are not empty
+    total_neurons = sum(sum(len(v) for v in g.values()) for g in groups.values())
+    if total_neurons == 0:
+        raise ValueError(
+            f"All neuron groups are empty! Check that phase 1 completed successfully."
+        )
+
     return groups
 
 
@@ -59,7 +74,7 @@ def extract_neuron_weights(
     """
     weights = {}
 
-    for layer_name, neuron_coords in neuron_groups.items():
+    for layer_name, neuron_coords in tqdm(neuron_groups.items(), desc="Extracting weights"):
         # Parse layer name: "layer_0_self_attn.q_proj" -> layer 0, module self_attn.q_proj
         parts = layer_name.split("_", 2)
         if len(parts) >= 3 and parts[0] == "layer":
@@ -80,9 +95,14 @@ def extract_neuron_weights(
 
                 # Extract specific neuron weights
                 for row, col in neuron_coords:
+                    # Bounds checking
+                    if row >= weight_matrix.shape[0] or col >= weight_matrix.shape[1]:
+                        print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight_matrix.shape}, skipping")
+                        continue
+
                     key = f"{layer_name}_{row}_{col}"
-                    # Store the full row (incoming weights to this neuron)
-                    weights[key] = weight_matrix[row, col].clone().cpu()
+                    # Store the weight value (convert bfloat16 to float32 for CPU compatibility)
+                    weights[key] = weight_matrix[row, col].float().clone().cpu()
 
             except (AttributeError, IndexError) as e:
                 print(f"Warning: Could not access {layer_name}: {e}")
@@ -91,40 +111,35 @@ def extract_neuron_weights(
     return weights
 
 
-def compute_cosine_similarity(
+def compute_absolute_change(
     initial_weights: Dict[str, torch.Tensor],
     current_weights: Dict[str, torch.Tensor]
 ) -> Dict[str, float]:
     """
-    Compute cosine similarity between initial and current weights.
+    Compute absolute change |current - initial| for each weight.
+
+    This is more appropriate than cosine similarity for scalar weights,
+    as it captures magnitude changes directly.
 
     Args:
         initial_weights: Initial weight values
         current_weights: Current weight values
 
     Returns:
-        Dictionary mapping neuron key to cosine similarity
+        Dictionary mapping neuron key to absolute change
     """
-    similarities = {}
+    changes = {}
 
     for key in initial_weights.keys():
         if key in current_weights:
             initial = initial_weights[key]
             current = current_weights[key]
 
-            # Cosine similarity for scalar values is just sign agreement
-            # For actual weight rows, use proper cosine similarity
-            if initial.numel() == 1:
-                # Single weight: just check if signs match
-                similarities[key] = 1.0 if torch.sign(initial) == torch.sign(current) else -1.0
-            else:
-                # Weight vector: compute cosine similarity
-                cos_sim = F.cosine_similarity(
-                    initial.unsqueeze(0), current.unsqueeze(0)
-                ).item()
-                similarities[key] = cos_sim
+            # Compute absolute difference
+            abs_change = torch.abs(current - initial).item()
+            changes[key] = abs_change
 
-    return similarities
+    return changes
 
 
 def compute_l2_distance(
@@ -158,7 +173,10 @@ def compute_relative_change(
     current_weights: Dict[str, torch.Tensor]
 ) -> Dict[str, float]:
     """
-    Compute relative change (L2 distance normalized by initial norm).
+    Compute relative change: |current - initial| / |initial|
+
+    For scalar weights, this is simply the percentage change.
+    For weight vectors, this uses L2 norms.
 
     Args:
         initial_weights: Initial weight values
@@ -174,11 +192,15 @@ def compute_relative_change(
             initial = initial_weights[key]
             current = current_weights[key]
 
-            initial_norm = torch.norm(initial, p=2).item()
-            if initial_norm > 1e-8:  # Avoid division by zero
-                l2_dist = torch.norm(current - initial, p=2).item()
-                relative_changes[key] = l2_dist / initial_norm
+            # Compute magnitudes
+            initial_mag = torch.abs(initial).item() if initial.numel() == 1 else torch.norm(initial, p=2).item()
+
+            if initial_mag > 1e-8:  # Avoid division by zero
+                # Compute change magnitude
+                change_mag = torch.abs(current - initial).item() if initial.numel() == 1 else torch.norm(current - initial, p=2).item()
+                relative_changes[key] = change_mag / initial_mag
             else:
+                # Undefined for near-zero initial weights
                 relative_changes[key] = 0.0
 
     return relative_changes
@@ -263,14 +285,14 @@ def compute_drift_metrics(
     current_weights = extract_neuron_weights(model, all_neurons, device)
 
     # Compute individual metrics
-    cosine_sims = compute_cosine_similarity(initial_weights, current_weights)
-    l2_dists = compute_l2_distance(initial_weights, current_weights)
+    # Use absolute and relative change instead of cosine similarity
+    # (more appropriate for scalar weights and LoRA modifications)
+    absolute_changes = compute_absolute_change(initial_weights, current_weights)
     relative_changes = compute_relative_change(initial_weights, current_weights)
 
     # Aggregate by group
     results = {
-        "cosine_similarity": aggregate_by_group(cosine_sims, neuron_groups),
-        "l2_distance": aggregate_by_group(l2_dists, neuron_groups),
+        "absolute_change": aggregate_by_group(absolute_changes, neuron_groups),
         "relative_change": aggregate_by_group(relative_changes, neuron_groups),
     }
 

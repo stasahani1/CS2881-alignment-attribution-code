@@ -64,6 +64,11 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
             name_end = len(filename)
         module_name = filename[name_start:name_end]
 
+        # Strip redundant "model.layers.{i}." prefix for compatibility with drift tracking
+        # SNIP scores have full paths like "model.layers.0.self_attn.q_proj"
+        # But we want keys like "layer_0_self_attn.q_proj"
+        module_name = module_name.replace(f"model.layers.{layer_idx}.", "")
+
         # Create unique key
         key = f"layer_{layer_idx}_{module_name}"
 

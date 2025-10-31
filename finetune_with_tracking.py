@@ -105,49 +105,6 @@ def load_alpaca_dataset(tokenizer, max_length: int = 512):
     return tokenized_dataset
 
 
-class DriftTrackingCallback:
-    """Callback to track neuron drift during training."""
-
-    def __init__(
-        self,
-        base_model,
-        initial_weights,
-        neuron_groups,
-        log_dir,
-        log_interval=100,
-    ):
-        self.base_model = base_model
-        self.initial_weights = initial_weights
-        self.neuron_groups = neuron_groups
-        self.log_dir = log_dir
-        self.log_interval = log_interval
-
-        os.makedirs(log_dir, exist_ok=True)
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        """Called at the end of each training step."""
-        if state.global_step % self.log_interval == 0:
-            print(f"\n[Step {state.global_step}] Computing drift metrics...")
-
-            # Compute drift metrics
-            drift_metrics = compute_drift_metrics(
-                self.base_model,
-                self.initial_weights,
-                self.neuron_groups,
-                device="cuda",
-            )
-
-            # Save drift log
-            save_drift_log(drift_metrics, state.global_step, self.log_dir)
-
-            # Print summary
-            print(f"Drift summary at step {state.global_step}:")
-            for metric_name, group_stats in drift_metrics.items():
-                print(f"  {metric_name}:")
-                for group_name, stats in group_stats.items():
-                    print(f"    {group_name}: mean={stats['mean']:.4f}, std={stats['std']:.4f}")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Fine-tune with LoRA and track neuron drift"
@@ -325,15 +282,21 @@ def main():
     print("Starting training...")
     print("=" * 70)
 
-    # Compute initial drift (should be zero)
+    # Compute initial drift (should be ~zero, sanity check)
     print("Computing initial drift (sanity check)...")
     drift_metrics = compute_drift_metrics(
-        model.get_base_model(),  # Get base model (without LoRA wrapper)
+        model.get_base_model(),  # Base model before any LoRA training
         initial_weights,
         neuron_groups,
         device="cuda",
     )
     save_drift_log(drift_metrics, 0, args.drift_log_dir)
+
+    # Print sanity check results
+    for metric_name, metric_data in drift_metrics.items():
+        print(f"\nInitial {metric_name}:")
+        for group_name, stats in metric_data.items():
+            print(f"  {group_name}: mean={stats['mean']:.6f}, max={stats['max']:.6f}")
     print()
 
     # Train
@@ -341,8 +304,14 @@ def main():
 
     # Compute final drift
     print("\nComputing final drift...")
+
+    # IMPORTANT: Merge LoRA weights into base model to get effective weights
+    # Without this, we'd only measure frozen base weights (which don't change during LoRA)
+    print("Merging LoRA weights into base model...")
+    model = model.merge_and_unload()
+
     drift_metrics = compute_drift_metrics(
-        model.get_base_model(),
+        model,  # Now contains W + LoRA modifications
         initial_weights,
         neuron_groups,
         device="cuda",

@@ -10,8 +10,8 @@ OUTPUT_DIR="/workspace/CS2881-alignment-attribution-code/neuron_groups"
 
 # Neuron identification parameters
 SNIP_TOP_K=0.01          # Top 1% for SNIP method
-SET_DIFF_P=0.1           # Top-p% utility neurons to exclude
-SET_DIFF_Q=0.1           # Top-q% safety neurons to consider
+SET_DIFF_P=0.05           # Top-p% utility neurons to exclude
+SET_DIFF_Q=0.05           # Top-q% safety neurons to consider
 
 echo "================================================"
 echo "Phase 1b: Identifying Neuron Groups"

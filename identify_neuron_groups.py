@@ -11,11 +11,13 @@ Only neuron IDs are saved, not the scores themselves.
 """
 
 import argparse
+import heapq
 import json
 import os
 import pickle
 from pathlib import Path
 from typing import Dict, List, Tuple
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -32,15 +34,15 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
     Returns:
         Dictionary mapping layer_name to score tensor
     """
-    wanda_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
+    snip_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
 
-    if not os.path.exists(wanda_score_dir):
-        raise FileNotFoundError(f"Score directory not found: {wanda_score_dir}")
+    if not os.path.exists(snip_score_dir):
+        raise FileNotFoundError(f"Score directory not found: {snip_score_dir}")
 
     scores = {}
-    score_files = sorted(Path(wanda_score_dir).glob("W_metric_layer_*.pkl"))
+    score_files = sorted(Path(snip_score_dir).glob("W_metric_layer_*.pkl"))
 
-    print(f"Loading SNIP scores from {wanda_score_dir}")
+    print(f"Loading SNIP scores from {snip_score_dir}")
     print(f"Found {len(score_files)} score files")
 
     for score_file in score_files:
@@ -80,35 +82,54 @@ def get_topk_neurons(
     k: float
 ) -> List[Tuple[str, int, int]]:
     """
-    Get top-k% neurons by score.
+    Get top-k% neurons per layer (matches original paper methodology).
 
     Args:
         scores: Dictionary mapping layer_name to score tensor
-        k: Fraction of neurons to select (e.g., 0.01 for top 1%)
+        k: Fraction of neurons to select per layer (e.g., 0.01 for top 1%)
 
     Returns:
         List of (layer_name, row, col) tuples for top neurons
     """
-    # Flatten all scores and track indices
-    all_scores = []
-    all_indices = []
+    result = []
+    total_neurons = 0
 
-    for layer_name, score in scores.items():
-        flat_score = score.flatten()
-        for idx in range(len(flat_score)):
-            row = idx // score.shape[1]
-            col = idx % score.shape[1]
-            all_scores.append(flat_score[idx].item())
-            all_indices.append((layer_name, row, col))
+    print(f"Selecting top {k*100:.1f}% neurons per layer...")
 
-    # Sort and get top-k%
-    num_topk = int(len(all_scores) * k)
-    topk_idx = np.argsort(all_scores)[-num_topk:]
-    topk_neurons = [all_indices[i] for i in topk_idx]
+    for layer_name, score in tqdm(scores.items(), desc="Processing layers"):
+        # Ensure tensor is on CPU for memory efficiency
+        if score.is_cuda:
+            score = score.cpu()
 
-    print(f"Selected {len(topk_neurons)} neurons (top {k*100:.1f}%)")
+        # Flatten and convert to numpy (convert to float32 first - bfloat16 not supported)
+        flat_scores = score.flatten().float().numpy()
 
-    return topk_neurons
+        # Calculate top-k for this layer
+        layer_k = max(1, int(len(flat_scores) * k))
+        layer_k = min(layer_k, len(flat_scores))
+
+        if layer_k == 0:
+            continue
+
+        # Get top-k indices for this layer using argpartition (O(n))
+        if layer_k < len(flat_scores):
+            topk_indices = np.argpartition(flat_scores, -layer_k)[-layer_k:]
+        else:
+            topk_indices = np.arange(len(flat_scores))
+
+        # Convert flat indices to row/col
+        rows = topk_indices // score.shape[1]
+        cols = topk_indices % score.shape[1]
+
+        # Add to result
+        for row, col in zip(rows, cols):
+            result.append((layer_name, int(row), int(col)))
+
+        total_neurons += len(topk_indices)
+
+    print(f"Selected {total_neurons:,} neurons total (top {k*100:.1f}% per layer)")
+
+    return result
 
 
 def get_set_difference_neurons(
@@ -119,6 +140,7 @@ def get_set_difference_neurons(
 ) -> List[Tuple[str, int, int]]:
     """
     Get neurons in top-q% safety but NOT in top-p% utility (set difference).
+    Uses layer-wise processing for memory efficiency and speed.
 
     Args:
         safety_scores: SNIP scores on safety dataset
@@ -129,22 +151,74 @@ def get_set_difference_neurons(
     Returns:
         List of (layer_name, row, col) tuples for set difference neurons
     """
-    # Get top-p% utility neurons
-    print(f"Computing top-{p*100:.1f}% utility neurons...")
-    utility_topk = set(get_topk_neurons(utility_scores, p))
+    result = []
+    total_safety = 0
+    total_utility = 0
+    total_diff = 0
 
-    # Get top-q% safety neurons
-    print(f"Computing top-{q*100:.1f}% safety neurons...")
-    safety_topk = set(get_topk_neurons(safety_scores, q))
+    print(f"Computing set difference (top-{q*100:.1f}% safety - top-{p*100:.1f}% utility)...")
+    print("Processing layer-by-layer for efficiency...")
 
-    # Set difference: safety - utility
-    set_diff = safety_topk - utility_topk
+    for layer_name in tqdm(sorted(safety_scores.keys()), desc="Set difference"):
+        if layer_name not in utility_scores:
+            print(f"Warning: {layer_name} not in utility scores, skipping")
+            continue
 
-    print(f"Set difference: {len(set_diff)} neurons")
-    print(f"  (Top-{q*100:.1f}% safety: {len(safety_topk)}, "
-          f"Top-{p*100:.1f}% utility: {len(utility_topk)})")
+        safety_score = safety_scores[layer_name]
+        utility_score = utility_scores[layer_name]
 
-    return list(set_diff)
+        # Ensure tensors are on CPU
+        if safety_score.is_cuda:
+            safety_score = safety_score.cpu()
+        if utility_score.is_cuda:
+            utility_score = utility_score.cpu()
+
+        # Calculate counts for this layer
+        total = safety_score.numel()
+        top_p = int(total * p)
+        top_q = int(total * q)
+
+        # Flatten scores (convert to float32 first - bfloat16 not supported by numpy)
+        flat_safety = safety_score.flatten().float().numpy()
+        flat_utility = utility_score.flatten().float().numpy()
+
+        # Get top indices (using argpartition for O(n) performance)
+        if top_p > 0 and top_p < len(flat_utility):
+            top_p_indices = np.argpartition(flat_utility, -top_p)[-top_p:]
+        elif top_p >= len(flat_utility):
+            top_p_indices = np.arange(len(flat_utility))
+        else:
+            top_p_indices = np.array([], dtype=np.int64)
+
+        if top_q > 0 and top_q < len(flat_safety):
+            top_q_indices = np.argpartition(flat_safety, -top_q)[-top_q:]
+        elif top_q >= len(flat_safety):
+            top_q_indices = np.arange(len(flat_safety))
+        else:
+            top_q_indices = np.array([], dtype=np.int64)
+
+        # Set difference: elements in top_q but not in top_p
+        # Note: indices are already unique (they're positions in the flattened array)
+        mask = ~np.isin(top_q_indices, top_p_indices)
+        filtered_indices = top_q_indices[mask]
+
+        total_safety += len(top_q_indices)
+        total_utility += len(top_p_indices)
+        total_diff += len(filtered_indices)
+
+        # Convert to row/col
+        rows = filtered_indices // safety_score.shape[1]
+        cols = filtered_indices % safety_score.shape[1]
+
+        # Add to result
+        for row, col in zip(rows, cols):
+            result.append((layer_name, int(row), int(col)))
+
+    print(f"Set difference: {total_diff} neurons")
+    print(f"  (Top-{q*100:.1f}% safety: {total_safety}, "
+          f"Top-{p*100:.1f}% utility: {total_utility})")
+
+    return result
 
 
 def get_random_neurons(
@@ -153,7 +227,8 @@ def get_random_neurons(
     seed: int = 0
 ) -> List[Tuple[str, int, int]]:
     """
-    Get random sample of neurons.
+    Get random sample of neurons using memory-efficient sampling.
+    Does not materialize the full index space.
 
     Args:
         scores: Dictionary mapping layer_name to score tensor (for dimensions)
@@ -165,20 +240,38 @@ def get_random_neurons(
     """
     np.random.seed(seed)
 
-    # Get all possible neuron indices
-    all_indices = []
-    for layer_name, score in scores.items():
-        for row in range(score.shape[0]):
-            for col in range(score.shape[1]):
-                all_indices.append((layer_name, row, col))
+    # Calculate layer sizes without materializing indices
+    layer_info = []
+    total_neurons = 0
 
-    # Random sample
-    sampled_idx = np.random.choice(len(all_indices), num_neurons, replace=False)
-    random_neurons = [all_indices[i] for i in sampled_idx]
+    for layer_name, score in sorted(scores.items()):
+        n = score.numel()
+        # Store: (layer_name, shape, offset, size)
+        layer_info.append((layer_name, score.shape, total_neurons, n))
+        total_neurons += n
 
-    print(f"Sampled {len(random_neurons)} random neurons")
+    print(f"Total neurons: {total_neurons:,}, sampling {num_neurons:,} random neurons")
 
-    return random_neurons
+    # Sample global indices
+    sampled_global_indices = np.random.choice(total_neurons, num_neurons, replace=False)
+
+    # Convert to (layer, row, col) without full materialization
+    sampled_neurons = []
+
+    for global_idx in sorted(sampled_global_indices):
+        # Find which layer this index belongs to
+        for layer_name, shape, offset, size in layer_info:
+            if offset <= global_idx < offset + size:
+                # Convert global index to local index within this layer
+                local_idx = global_idx - offset
+                row = local_idx // shape[1]
+                col = local_idx % shape[1]
+                sampled_neurons.append((layer_name, int(row), int(col)))
+                break
+
+    print(f"Sampled {len(sampled_neurons)} random neurons")
+
+    return sampled_neurons
 
 
 def save_neuron_groups(
@@ -219,6 +312,18 @@ def main():
         type=str,
         default="/dev/shm/snip_scores",
         help="Base directory containing SNIP scores"
+    )
+    parser.add_argument(
+        "--safety_dataset",
+        type=str,
+        default="align",
+        help="Safety dataset name"
+    )
+    parser.add_argument(
+        "--utility_dataset",
+        type=str,
+        default="alpaca_cleaned_no_safety",
+        help="Utility dataset name"
     )
     parser.add_argument(
         "--output_dir",
@@ -267,11 +372,11 @@ def main():
 
     # Load SNIP scores
     print("Loading safety SNIP scores...")
-    safety_scores = load_snip_scores(args.score_base_dir, "align")
+    safety_scores = load_snip_scores(args.score_base_dir, args.safety_dataset)
     print()
 
     print("Loading utility SNIP scores...")
-    utility_scores = load_snip_scores(args.score_base_dir, "alpaca_cleaned_no_safety")
+    utility_scores = load_snip_scores(args.score_base_dir, args.utility_dataset)
     print()
 
     # Verify same layers in both
@@ -287,7 +392,7 @@ def main():
     safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
     save_neuron_groups(
         safety_topk,
-        os.path.join(args.output_dir, "neuron_groups_snip_top.json")
+        os.path.join(args.output_dir, "neuron_groups_safety.json")
     )
     print()
 

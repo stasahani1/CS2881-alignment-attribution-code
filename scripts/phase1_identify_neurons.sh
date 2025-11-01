@@ -13,6 +13,8 @@ UTILITY_DATASET="alpaca_cleaned_no_safety"
 SNIP_TOP_K=0.01          # Top 1% for SNIP method
 SET_DIFF_P=0.03           # Top-p% utility neurons to exclude
 SET_DIFF_Q=0.03           # Top-q% safety neurons to consider
+# Methods to run
+METHODS="top_safety set_difference"
 
 echo "================================================"
 echo "Phase 1b: Identifying Neuron Groups"
@@ -34,6 +36,7 @@ python identify_neuron_groups.py \
     --snip_top_k "${SNIP_TOP_K}" \
     --set_diff_p "${SET_DIFF_P}" \
     --set_diff_q "${SET_DIFF_Q}" \
+    --methods "${METHODS}"
     --seed 0
 
 echo ""

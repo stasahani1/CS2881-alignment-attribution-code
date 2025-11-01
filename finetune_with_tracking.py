@@ -230,9 +230,13 @@ def main():
 
     # Extract and save initial weights (before LoRA)
     print("Extracting initial weights...")
+    # Merge all neuron groups into a single dict, combining coords for overlapping layers
     all_neurons = {}
     for group_name, group_data in neuron_groups.items():
-        all_neurons.update(group_data)
+        for layer_name, coords in group_data.items():
+            if layer_name not in all_neurons:
+                all_neurons[layer_name] = []
+            all_neurons[layer_name].extend(coords)
 
     initial_weights = extract_neuron_weights(model, all_neurons, device="cuda")
 

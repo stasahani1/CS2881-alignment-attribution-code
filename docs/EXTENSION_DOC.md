@@ -19,6 +19,5 @@ This extension implements experiments to understand **why safety alignment is br
 - **Hypothesis B (Recontextualization)**: They move less but are recontextualized—fine-tuning activates new harmful circuits instead of destroying old safety ones.
 
 **Key Metrics**:
-- Cosine similarity between pre/post fine-tune weight vectors per neuron
-- L2 distance of weight changes
+- Relative weight between pre/post fine-tune neurons
 - Comparison: safety-critical vs. random vs. utility-critical neurons

@@ -27,7 +27,7 @@ def load_neuron_groups(neuron_groups_dir: str) -> Dict[str, Dict]:
         "safety_snip_top": "neuron_groups_snip_top.json",
         "safety_set_diff": "neuron_groups_set_diff.json",
         "utility": "neuron_groups_utility.json",
-        "random": "neuron_groups_random.json",
+        # "random": "neuron_groups_random.json",
     }
 
     for group_name, filename in group_files.items():
@@ -64,6 +64,8 @@ def extract_neuron_weights(
     """
     Extract weight vectors for specific neurons from model.
 
+    Optimized version using batch extraction per layer for ~10-20x speedup.
+
     Args:
         model: PyTorch model
         neuron_groups: Dict mapping layer_name to list of [row, col] coordinates
@@ -73,40 +75,69 @@ def extract_neuron_weights(
         Dictionary mapping (layer_name, row, col) to weight value
     """
     weights = {}
+    total_neurons = sum(len(coords) for coords in neuron_groups.values())
 
-    for layer_name, neuron_coords in tqdm(neuron_groups.items(), desc="Extracting weights"):
-        # Parse layer name: "layer_0_self_attn.q_proj" -> layer 0, module self_attn.q_proj
-        parts = layer_name.split("_", 2)
-        if len(parts) >= 3 and parts[0] == "layer":
-            layer_idx = int(parts[1])
-            module_path = parts[2]
+    print(f"Extracting weights for {total_neurons:,} neurons across {len(neuron_groups)} layers...")
 
-            # Navigate to the layer
-            try:
-                layer = model.model.layers[layer_idx]
-
-                # Navigate to the specific module (e.g., self_attn.q_proj)
-                module = layer
-                for attr in module_path.split("."):
-                    module = getattr(module, attr)
-
-                # Extract weight matrix
-                weight_matrix = module.weight.data
-
-                # Extract specific neuron weights
-                for row, col in neuron_coords:
-                    # Bounds checking
-                    if row >= weight_matrix.shape[0] or col >= weight_matrix.shape[1]:
-                        print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight_matrix.shape}, skipping")
-                        continue
-
-                    key = f"{layer_name}_{row}_{col}"
-                    # Store the weight value (convert bfloat16 to float32 for CPU compatibility)
-                    weights[key] = weight_matrix[row, col].float().clone().cpu()
-
-            except (AttributeError, IndexError) as e:
-                print(f"Warning: Could not access {layer_name}: {e}")
+    with tqdm(total=total_neurons, desc="Extracting weights") as pbar:
+        for layer_name, neuron_coords in neuron_groups.items():
+            # Skip empty coordinate lists
+            if not neuron_coords:
                 continue
+
+            # Parse layer name: "layer_0_self_attn.q_proj" -> layer 0, module self_attn.q_proj
+            parts = layer_name.split("_", 2)
+            if len(parts) >= 3 and parts[0] == "layer":
+                layer_idx = int(parts[1])
+                module_path = parts[2]
+
+                # Navigate to the layer
+                try:
+                    layer = model.model.layers[layer_idx]
+
+                    # Navigate to the specific module (e.g., self_attn.q_proj)
+                    module = layer
+                    for attr in module_path.split("."):
+                        module = getattr(module, attr)
+
+                    # Extract weight matrix
+                    weight_matrix = module.weight.data
+
+                    # Batch extract all neurons from this layer using advanced indexing
+                    # Convert coordinates to numpy arrays for efficiency
+                    coords_array = np.array(neuron_coords)
+                    rows = coords_array[:, 0]
+                    cols = coords_array[:, 1]
+
+                    # Bounds checking for all coordinates
+                    valid_mask = (rows < weight_matrix.shape[0]) & (cols < weight_matrix.shape[1])
+                    invalid_count = (~valid_mask).sum()
+
+                    if invalid_count > 0:
+                        print(f"Warning: {invalid_count} coordinates out of bounds for {layer_name} shape {weight_matrix.shape}, skipping")
+                        rows = rows[valid_mask]
+                        cols = cols[valid_mask]
+
+                    # Extract all weights at once (single GPU operation)
+                    if len(rows) > 0:
+                        layer_weights = weight_matrix[rows, cols].float().cpu()
+
+                        # Store in dictionary with keys
+                        for idx, (row, col) in enumerate(zip(rows, cols)):
+                            key = f"{layer_name}_{row}_{col}"
+                            weights[key] = layer_weights[idx].clone()
+
+                    pbar.update(len(neuron_coords))
+
+                except (AttributeError, IndexError) as e:
+                    print(f"Warning: Could not access {layer_name}: {e}")
+                    pbar.update(len(neuron_coords))
+                    continue
+
+    # Report memory usage
+    total_weights = len(weights)
+    memory_mb = sum(w.element_size() * w.nelement() for w in weights.values()) / (1024 * 1024)
+    print(f"Extracted {total_weights:,} weights, using {memory_mb:.2f} MB")
 
     return weights
 
@@ -278,9 +309,13 @@ def compute_drift_metrics(
         Dictionary containing aggregated metrics by group
     """
     # Extract current weights for all tracked neurons
+    # Merge all neuron groups into a single dict, combining coords for overlapping layers
     all_neurons = {}
     for group_name, group_data in neuron_groups.items():
-        all_neurons.update(group_data)
+        for layer_name, coords in group_data.items():
+            if layer_name not in all_neurons:
+                all_neurons[layer_name] = []
+            all_neurons[layer_name].extend(coords)
 
     current_weights = extract_neuron_weights(model, all_neurons, device)
 

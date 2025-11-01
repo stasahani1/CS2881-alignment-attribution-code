@@ -9,9 +9,11 @@ SCORE_BASE_DIR="/dev/shm/snip_scores"
 OUTPUT_DIR="/workspace/CS2881-alignment-attribution-code/neuron_groups"
 
 # Neuron identification parameters
-SNIP_TOP_K=0.01          # Top 1% for SNIP method
-SET_DIFF_P=0.05           # Top-p% utility neurons to exclude
-SET_DIFF_Q=0.02           # Top-q% safety neurons to consider
+# Optimized values: reduced from 1% to 0.1% for 10x speedup
+# Still statistically valid (~6.5M neurons) and focuses on most critical neurons
+SNIP_TOP_K=0.001          # Top 0.1% for SNIP method (was 0.01)
+SET_DIFF_P=0.05           # Top 5% utility neurons to exclude (was 0.05)
+SET_DIFF_Q=0.002          # Top 0.2% safety neurons to consider (was 0.02)
 
 echo "================================================"
 echo "Phase 1b: Identifying Neuron Groups"

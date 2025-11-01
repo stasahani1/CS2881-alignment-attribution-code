@@ -1,0 +1,92 @@
+======================================================================
+NEURON DRIFT ANALYSIS REPORT
+======================================================================
+
+Training Steps Analyzed: 2
+Step Range: 0 - 1500
+
+----------------------------------------------------------------------
+ABSOLUTE CHANGE
+----------------------------------------------------------------------
+
+Final Values by Group:
+  safety_snip_top:
+    Mean:   0.000046
+    Std:    0.000149
+    Median: 0.000000
+    Range:  [0.000000, 0.006592]
+    Count:  6475904
+  safety_set_diff:
+    Mean:   0.000021
+    Std:    0.000097
+    Median: 0.000000
+    Range:  [0.000000, 0.005859]
+    Count:  2360147
+  utility:
+    Mean:   0.000046
+    Std:    0.000147
+    Median: 0.000000
+    Range:  [0.000000, 0.007324]
+    Count:  6475904
+
+Statistical Comparisons:
+  safety_snip_top_vs_utility:
+    Mean Difference: -0.000000
+    Cohen's d:       -0.000535
+  safety_set_diff_vs_utility:
+    Mean Difference: -0.000025
+    Cohen's d:       -0.196655
+
+----------------------------------------------------------------------
+RELATIVE CHANGE
+----------------------------------------------------------------------
+
+Final Values by Group:
+  safety_snip_top:
+    Mean:   0.002978
+    Std:    0.019540
+    Median: 0.000000
+    Range:  [0.000000, 5.104712]
+    Count:  6475904
+  safety_set_diff:
+    Mean:   0.000954
+    Std:    0.006757
+    Median: 0.000000
+    Range:  [0.000000, 1.286070]
+    Count:  2360147
+  utility:
+    Mean:   0.003171
+    Std:    0.021687
+    Median: 0.000000
+    Range:  [0.000000, 5.104712]
+    Count:  6475904
+
+Statistical Comparisons:
+  safety_snip_top_vs_utility:
+    Mean Difference: -0.000193
+    Cohen's d:       -0.009350
+  safety_set_diff_vs_utility:
+    Mean Difference: -0.002217
+    Cohen's d:       -0.138028
+
+======================================================================
+HYPOTHESIS EVALUATION
+======================================================================
+
+H1 (Fragile Safety): Safety neurons drift MORE than utility neurons
+  → Higher absolute/relative change
+
+H2 (Pathway Creation): Safety neurons drift SIMILAR or LESS
+  → Supports alternative pathway hypothesis
+
+Results (using absolute_change):
+  safety_snip_top:
+    absolute_change: 0.000046 (utility: 0.000046)
+    Difference: -0.000000
+    → Supports H2 (Pathway Creation)
+
+  safety_set_diff:
+    absolute_change: 0.000021 (utility: 0.000046)
+    Difference: -0.000025
+    → Supports H2 (Pathway Creation)
+

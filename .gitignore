@@ -1,3 +1,5 @@
 .DS_Store
 lib/__pycache__
 models/
+neuron_groups/
+finetuned_models/

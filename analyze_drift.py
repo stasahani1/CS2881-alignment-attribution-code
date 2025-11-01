@@ -226,38 +226,46 @@ def statistical_tests(
 
     results = {}
 
-    # Compare each safety group vs random
+    # Compare each group against each other
     group_names = list(final_metrics.keys())
 
-    # Find random group
-    random_group = None
+    # Find utility group as baseline (or random if available)
+    baseline_group = None
     for name in group_names:
-        if "random" in name.lower():
-            random_group = name
+        if "utility" in name.lower():
+            baseline_group = name
             break
 
-    if random_group is None:
-        print("Warning: No random group found for statistical testing")
+    # Fall back to random if utility not found
+    if baseline_group is None:
+        for name in group_names:
+            if "random" in name.lower():
+                baseline_group = name
+                break
+
+    if baseline_group is None:
+        print(f"\nWarning: No baseline group (utility/random) found for {metric_name}")
+        print(f"Available groups: {group_names}")
         return results
 
-    random_stats = final_metrics[random_group]
+    baseline_stats = final_metrics[baseline_group]
 
-    print(f"\n{metric_name.upper()} - Statistical Comparisons vs {random_group}:")
+    print(f"\n{metric_name.upper()} - Statistical Comparisons vs {baseline_group}:")
     print("=" * 60)
 
     for group_name in group_names:
-        if group_name == random_group:
+        if group_name == baseline_group:
             continue
 
         group_stats = final_metrics[group_name]
 
         # We don't have individual data points, so we'll compare means
         # and report effect size (Cohen's d)
-        mean_diff = group_stats["mean"] - random_stats["mean"]
+        mean_diff = group_stats["mean"] - baseline_stats["mean"]
 
         # Cohen's d: difference in means / pooled standard deviation
         pooled_std = np.sqrt(
-            (group_stats["std"]**2 + random_stats["std"]**2) / 2
+            (group_stats["std"]**2 + baseline_stats["std"]**2) / 2
         )
 
         if pooled_std > 0:
@@ -265,17 +273,17 @@ def statistical_tests(
         else:
             cohens_d = 0.0
 
-        results[f"{group_name}_vs_{random_group}"] = {
+        results[f"{group_name}_vs_{baseline_group}"] = {
             "mean_diff": mean_diff,
             "cohens_d": cohens_d,
             "group_mean": group_stats["mean"],
-            "random_mean": random_stats["mean"],
+            "baseline_mean": baseline_stats["mean"],
             "group_std": group_stats["std"],
-            "random_std": random_stats["std"],
+            "baseline_std": baseline_stats["std"],
         }
 
         print(f"{group_name}:")
-        print(f"  Mean: {group_stats['mean']:.4f} (random: {random_stats['mean']:.4f})")
+        print(f"  Mean: {group_stats['mean']:.4f} ({baseline_group}: {baseline_stats['mean']:.4f})")
         print(f"  Difference: {mean_diff:+.4f}")
         print(f"  Cohen's d: {cohens_d:+.4f} ", end="")
 
@@ -321,10 +329,7 @@ def generate_summary_report(
         final_step = max(drift_logs.keys())
         final_metrics = drift_logs[final_step]
 
-        for metric_name in ["cosine_similarity", "l2_distance", "relative_change"]:
-            if metric_name not in final_metrics:
-                continue
-
+        for metric_name in final_metrics.keys():
             f.write("-" * 70 + "\n")
             f.write(f"{metric_name.upper().replace('_', ' ')}\n")
             f.write("-" * 70 + "\n\n")
@@ -339,7 +344,7 @@ def generate_summary_report(
                 f.write(f"    Count:  {stats['count']}\n")
 
             # Statistical comparisons
-            if metric_name in statistical_results:
+            if metric_name in statistical_results and statistical_results[metric_name]:
                 f.write("\nStatistical Comparisons:\n")
                 for comparison, results in statistical_results[metric_name].items():
                     f.write(f"  {comparison}:\n")
@@ -353,38 +358,44 @@ def generate_summary_report(
         f.write("HYPOTHESIS EVALUATION\n")
         f.write("=" * 70 + "\n\n")
 
-        # Check if safety neurons drift more (H1) or similar (H2)
-        safety_groups = [k for k in final_metrics["cosine_similarity"].keys()
+        # Use absolute_change or relative_change for comparison
+        primary_metric = "absolute_change" if "absolute_change" in final_metrics else list(final_metrics.keys())[0]
+
+        # Check if safety neurons drift more (H1) or similar (H2) compared to utility
+        safety_groups = [k for k in final_metrics[primary_metric].keys()
                         if "safety" in k.lower()]
-        random_group = [k for k in final_metrics["cosine_similarity"].keys()
-                       if "random" in k.lower()]
+        utility_groups = [k for k in final_metrics[primary_metric].keys()
+                         if "utility" in k.lower()]
 
-        if safety_groups and random_group:
-            random_cos_sim = final_metrics["cosine_similarity"][random_group[0]]["mean"]
+        f.write("H1 (Fragile Safety): Safety neurons drift MORE than utility neurons\n")
+        f.write("  → Higher absolute/relative change\n\n")
 
-            f.write("H1 (Fragile Safety): Safety neurons drift MORE than random\n")
-            f.write("  → Lower cosine similarity, higher L2 distance\n\n")
+        f.write("H2 (Pathway Creation): Safety neurons drift SIMILAR or LESS\n")
+        f.write("  → Supports alternative pathway hypothesis\n\n")
 
-            f.write("H2 (Pathway Creation): Safety neurons drift LESS or SIMILAR\n")
-            f.write("  → Supports alternative pathway hypothesis\n\n")
+        if safety_groups and utility_groups:
+            utility_drift = final_metrics[primary_metric][utility_groups[0]]["mean"]
 
-            f.write("Results:\n")
+            f.write(f"Results (using {primary_metric}):\n")
             for group in safety_groups:
-                safety_cos_sim = final_metrics["cosine_similarity"][group]["mean"]
-                diff = safety_cos_sim - random_cos_sim
+                safety_drift = final_metrics[primary_metric][group]["mean"]
+                diff = safety_drift - utility_drift
 
                 f.write(f"  {group}:\n")
-                f.write(f"    Cosine similarity: {safety_cos_sim:.6f} "
-                       f"(random: {random_cos_sim:.6f})\n")
+                f.write(f"    {primary_metric}: {safety_drift:.6f} "
+                       f"(utility: {utility_drift:.6f})\n")
                 f.write(f"    Difference: {diff:+.6f}\n")
 
-                if diff < -0.01:  # Safety drifts more
+                if diff > 0.01:  # Safety drifts more
                     f.write("    → Supports H1 (Fragile Safety)\n")
                 elif abs(diff) < 0.01:  # Similar drift
                     f.write("    → Supports H2 (Pathway Creation)\n")
                 else:  # Safety drifts less
                     f.write("    → Supports H2 (Pathway Creation, strong)\n")
                 f.write("\n")
+        else:
+            f.write("Note: Safety vs Utility comparison not available.\n")
+            f.write("Available groups: " + ", ".join(final_metrics[primary_metric].keys()) + "\n\n")
 
     print(f"Saved report: {output_path}")
 
@@ -427,21 +438,26 @@ def main():
         print("Error: No drift logs found!")
         return
 
+    # Determine which metrics are available in the logs
+    first_step = min(drift_logs.keys())
+    available_metrics = list(drift_logs[first_step].keys())
+    print(f"Available metrics: {available_metrics}")
+
     # Generate time series plots
     print("\nGenerating time series plots...")
-    for metric_name in ["cosine_similarity", "l2_distance", "relative_change"]:
+    for metric_name in available_metrics:
         plot_time_series(drift_logs, metric_name, figures_dir, stat_name="mean")
         plot_time_series(drift_logs, metric_name, figures_dir, stat_name="std")
 
     # Generate distribution plots
     print("\nGenerating distribution plots...")
-    for metric_name in ["cosine_similarity", "l2_distance", "relative_change"]:
+    for metric_name in available_metrics:
         plot_final_distributions(drift_logs, metric_name, figures_dir)
 
     # Statistical tests
     print("\nPerforming statistical tests...")
     statistical_results = {}
-    for metric_name in ["cosine_similarity", "l2_distance", "relative_change"]:
+    for metric_name in available_metrics:
         results = statistical_tests(drift_logs, metric_name)
         statistical_results[metric_name] = results
 

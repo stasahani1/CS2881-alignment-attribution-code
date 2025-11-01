@@ -34,7 +34,7 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
     Returns:
         Dictionary mapping layer_name to score tensor
     """
-    snip_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
+    snip_score_dir = os.path.join(score_dir, dataset_name, "snip_score")
 
     if not os.path.exists(snip_score_dir):
         raise FileNotFoundError(f"Score directory not found: {snip_score_dir}")

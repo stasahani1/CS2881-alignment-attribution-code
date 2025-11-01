@@ -14,9 +14,11 @@ SEED=0
 
 # Output directories (using /dev/shm for large temporary files)
 # SCORE_BASE_DIR="/dev/shm/snip_scores"
-SCORE_BASE_DIR="outputs/snip_scores"
-SAFETY_SCORE_DIR="${SCORE_BASE_DIR}/align_short"
-UTILITY_SCORE_DIR="${SCORE_BASE_DIR}/alpaca_cleaned_no_safety"
+SCORE_BASE_DIR="/tmp/snip_scores"
+SAFETY_DATASET="align_short"
+UTILITY_DATASET="alpaca_cleaned_no_safety"
+SAFETY_SCORE_DIR="${SCORE_BASE_DIR}/${SAFETY_DATASET}"
+UTILITY_SCORE_DIR="${SCORE_BASE_DIR}/${UTILITY_DATASET}"
 
 echo "================================================"
 echo "Phase 1: Computing SNIP Scores"
@@ -36,7 +38,7 @@ python main.py \
     --model "${MODEL}" \
     --cache_dir "${CACHE_DIR}" \
     --prune_method "${METHOD}" \
-    --prune_data align \
+    --prune_data "${SAFETY_DATASET}" \
     --sparsity_ratio "${SPARSITY_RATIO}" \
     --save "${SAFETY_SCORE_DIR}" \
     --dump_wanda_score \
@@ -50,7 +52,7 @@ python main.py \
     --model "${MODEL}" \
     --cache_dir "${CACHE_DIR}" \
     --prune_method "${METHOD}" \
-    --prune_data alpaca_cleaned_no_safety \
+    --prune_data "${UTILITY_DATASET}" \
     --sparsity_ratio "${SPARSITY_RATIO}" \
     --save "${UTILITY_SCORE_DIR}" \
     --dump_wanda_score \
@@ -62,7 +64,7 @@ echo "================================================"
 echo "Phase 1 Complete!"
 echo "================================================"
 echo "SNIP scores saved to:"
-echo "  Safety:  ${SAFETY_SCORE_DIR}/wanda_score/"
-echo "  Utility: ${UTILITY_SCORE_DIR}/wanda_score/"
+echo "  Safety:  ${SAFETY_SCORE_DIR}/snip_score/"
+echo "  Utility: ${UTILITY_SCORE_DIR}/snip_score/"
 echo ""
 echo "Next step: Run phase1_identify_neurons.sh"

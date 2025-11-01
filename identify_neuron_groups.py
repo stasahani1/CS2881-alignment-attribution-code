@@ -67,6 +67,11 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
         # Create unique key
         key = f"layer_{layer_idx}_{module_name}"
 
+        # Strip redundant "model.layers.{i}." prefix for compatibility with drift tracking
+        # SNIP scores have full paths like "model.layers.0.self_attn.q_proj"
+        # But we want keys like "layer_0_self_attn.q_proj"
+        module_name = module_name.replace(f"model.layers.{layer_idx}.", "")
+
         # Load score tensor
         with open(score_file, "rb") as f:
             score = pickle.load(f)

@@ -32,10 +32,10 @@ print("# of gpus: ", torch.cuda.device_count())
 SAVE_PATH = "/dev/shm/pruned_models"  # Use shared memory to avoid /workspace quota
 
 modeltype2path = {
-    "llama2-7b-chat-hf": "/tmp/llama-2-7b-chat-hf/",
-    "llama2-13b-chat-hf": "",
-    "llama2-7b-hf": "",
-    "llama2-13b-hf": "",
+    "llama2-7b-chat-hf": "meta-llama/Llama-2-7b-chat-hf",
+    "llama2-13b-chat-hf": "meta-llama/Llama-2-13b-chat-hf",
+    "llama2-7b-hf": "meta-llama/Llama-2-7b-hf",
+    "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
 }
 
 
@@ -438,11 +438,12 @@ def main():
         )
         os.makedirs(SAVE_PATH, exist_ok=True)  # Ensure directory exists
         model.save_pretrained(pruned_path)
+        tokenizer.save_pretrained(pruned_path)  # Save tokenizer with model
         vllm_model = LLM(
             model=pruned_path,
-            tokenizer=modeltype2path[args.model],
+            tokenizer=pruned_path,  # Load tokenizer from same path as model
             dtype="bfloat16",
-            swap_space=128,
+            swap_space=0,
         )
         if args.decouple_align_utility or args.decouple_align_misalign:
             vllm_model.llm_engine.tokenizer.add_special_tokens({"pad_token": "[PAD]"})

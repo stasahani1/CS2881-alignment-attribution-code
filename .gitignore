@@ -2,3 +2,4 @@
 __pycache__
 models/
 outputs/
+finetuned_models/

@@ -314,15 +314,14 @@ def load_alpaca_dataset(tokenizer, max_length: int = 512):
     """Load and tokenize Alpaca dataset."""
     print("Loading Alpaca dataset...")
 
-    # Load dataset
-    dataset = load_dataset("tatsu-lab/alpaca", split="train")
+    # Load dataset from CSV file directly using datasets library
+    dataset = load_dataset("csv", data_files="data/alpaca_cleaned_on_safety_train.csv", split="train")
 
     def format_prompt(example):
-        """Format Alpaca prompt."""
-        if example["input"]:
-            text = f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:\n{example['output']}"
-        else:
-            text = f"### Instruction:\n{example['instruction']}\n\n### Response:\n{example['output']}"
+        """Format Alpaca prompt from CSV data."""
+        # CSV has 'prompt' and 'response' columns
+        # prompt already contains [INST] tags, so we just append response
+        text = f"{example['prompt']} {example['response']}"
         return {"text": text}
 
     dataset = dataset.map(format_prompt)
@@ -349,7 +348,6 @@ def load_alpaca_dataset(tokenizer, max_length: int = 512):
 
     print(f"Dataset size: {len(tokenized_dataset)}")
     return tokenized_dataset
-
 
 def main():
     parser = argparse.ArgumentParser(

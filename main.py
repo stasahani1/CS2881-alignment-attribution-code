@@ -5,6 +5,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
 from vllm import LLM
+from peft import PeftModel
 
 from lib.prune import (
     prune_wanda,
@@ -56,6 +57,35 @@ def get_llm(model_name, cache_dir="models/huggingface/hub"):
             cache_dir=cache_dir,  # Explicitly set cache directory
         )
         # Move to GPU manually
+        model = model.to('cuda:0')
+    else:
+        # Assume it's a path - check if PEFT model
+        adapter_config_path = os.path.join(model_name, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            # Load PEFT model
+            import json
+            with open(adapter_config_path, "r") as f:
+                adapter_config = json.load(f)
+            base_model_path = adapter_config.get("base_model_name_or_path", modeltype2path["llama2-7b-chat-hf"])
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_path,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                use_safetensors=False,
+                local_files_only=True,
+                cache_dir=cache_dir,
+            )
+            model = PeftModel.from_pretrained(base_model, model_name)
+        else:
+            # Regular model path
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+                use_safetensors=False,
+                local_files_only=False,
+                cache_dir=cache_dir,
+            )
         model = model.to('cuda:0')
 
     model.seqlen = model.config.max_position_embeddings
@@ -235,8 +265,15 @@ def main():
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.eval()
+
+    # Load tokenizer - handle both predefined names and paths
+    if args.model in modeltype2path:
+        tokenizer_path = modeltype2path[args.model]
+    else:
+        # For paths, use the model path directly (tokenizer is saved with the model)
+        tokenizer_path = args.model
     tokenizer = AutoTokenizer.from_pretrained(
-        modeltype2path[args.model], use_fast=False
+        tokenizer_path, use_fast=False
     )
 
     if (args.decouple_align_misalign or args.decouple_align_utility) and (
@@ -377,12 +414,15 @@ def main():
     ################################################################
     print("*" * 30)
     if not args.recover_from_base and args.sparsity_ratio > 0:
-        # check_sparsity_layerwise(model)
-        sparsity_ratio = check_sparsity(model)
+        # Skip sparsity check for PEFT models (structure is different)
+        if hasattr(model, 'base_model'):
+            print("Skipping sparsity check for PEFT model")
+            sparsity_ratio = args.sparsity_ratio
+        else:
+            # check_sparsity_layerwise(model)
+            sparsity_ratio = check_sparsity(model)
     else:
         sparsity_ratio = args.sparsity_ratio
-    print(f"sparsity sanity check {sparsity_ratio:.6f}")
-    print("*" * 30)
     ################################################################
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")

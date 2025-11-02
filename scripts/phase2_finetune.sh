@@ -18,7 +18,7 @@ GRAD_ACCUM=4
 LEARNING_RATE=1e-4
 MAX_LENGTH=512
 MAX_STEPS=-1  # -1 for full training, set to smaller number for testing
-SAVE_STEPS=1000  # Save checkpoint every N steps
+# Note: No intermediate checkpoints saved, only final model at end
 
 # Paths
 NEURON_GROUPS_DIR="/workspace/CS2881-alignment-attribution-code/outputs/neuron_groups"
@@ -41,7 +41,7 @@ echo "LoRA: r=${LORA_R}, alpha=${LORA_ALPHA}"
 echo "Training: ${NUM_EPOCHS} epochs, lr=${LEARNING_RATE}"
 echo "Batch size: ${BATCH_SIZE} (grad accum: ${GRAD_ACCUM})"
 echo "Max steps: ${MAX_STEPS}"
-echo "Save steps: ${SAVE_STEPS}"
+echo "Note: Only final model will be saved (no intermediate checkpoints)"
 echo ""
 if [ -n "${FREEZE_SAFETY_NEURONS}" ]; then
     echo "Freezing safety neurons from: ${FREEZE_SAFETY_NEURONS}"
@@ -86,7 +86,6 @@ ARGS=(
     --max_length "${MAX_LENGTH}"
     --max_steps "${MAX_STEPS}"
     --neuron_groups_dir "${NEURON_GROUPS_DIR}"
-    --save_steps "${SAVE_STEPS}"
 )
 
 # Add initial_weights_dir only if not freezing

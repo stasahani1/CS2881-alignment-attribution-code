@@ -67,8 +67,13 @@ def setup_lora(model, lora_r: int = 8, lora_alpha: int = 16, target_modules=None
 
 def freeze_safety_critical_neurons(model, neuron_groups_file: str):
     """
-    Freeze safety-critical neurons by setting requires_grad=False and registering hooks
-    to zero gradients during backpropagation.
+    Freeze safety-critical neurons by preventing LoRA adapters from updating them.
+    
+    For LoRA, base model weights are already frozen. To prevent LoRA adapters from
+    affecting specific neurons, we:
+    1. Find the LoRA adapter for each module
+    2. Zero out corresponding rows in lora_B matrices (preventing LoRA updates to those output neurons)
+    3. Set requires_grad=False and register hooks to prevent gradient updates
     
     Args:
         model: Model with LoRA applied (PEFT model)
@@ -90,10 +95,20 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
     
     # Get base model (LoRA wraps the base model)
     # PEFT models have a base_model attribute
+    # Need to access the transformer model (LlamaModel) which has .layers
     if hasattr(model, 'base_model'):
-        base_model = model.base_model.model
+        base_model_full = model.base_model.model
+        # Check if we need to go one level deeper to get LlamaModel with .layers
+        if hasattr(base_model_full, 'model') and hasattr(base_model_full.model, 'layers'):
+            base_model = base_model_full.model  # This is LlamaModel with .layers
+        else:
+            base_model = base_model_full
     elif hasattr(model, 'get_base_model'):
-        base_model = model.get_base_model()
+        base_model_full = model.get_base_model()
+        if hasattr(base_model_full, 'model') and hasattr(base_model_full.model, 'layers'):
+            base_model = base_model_full.model
+        else:
+            base_model = base_model_full
     else:
         # Fallback: assume model is already base model or try direct access
         base_model = model.model if hasattr(model, 'model') else model
@@ -103,6 +118,9 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
     
     # Store original weight values for safety
     original_weights = {}
+    
+    # Track frozen rows per layer/module for LoRA adapter freezing
+    frozen_rows_by_module = {}
     
     for layer_name, neuron_coords in safety_neurons.items():
         # Parse layer name: "layer_0_mlp.down_proj" -> layer 0, module mlp.down_proj
@@ -123,8 +141,9 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                 # Get weight matrix
                 weight = module.weight
                 
-                # Store neuron coordinates instead of creating full masks (memory efficient)
+                # Store neuron coordinates and track frozen rows
                 valid_coords = []
+                frozen_rows = set()
                 
                 for coord in neuron_coords:
                     if len(coord) == 2:
@@ -132,6 +151,7 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                         # Bounds checking
                         if row < weight.shape[0] and col < weight.shape[1]:
                             valid_coords.append((row, col))
+                            frozen_rows.add(row)  # Track which rows need to be frozen
                             # Store original weight value
                             key = f"{layer_name}_{row}_{col}"
                             original_weights[key] = weight.data[row, col].clone().cpu()  # Move to CPU immediately
@@ -139,43 +159,138 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                         else:
                             print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight.shape}, skipping")
                 
-                # Set requires_grad=False for frozen neurons
-                if valid_coords:
-                    # Create a hook to zero gradients for frozen neurons
-                    # Store coordinates as tuples (memory efficient, no full mask needed)
-                    coords_tuple = tuple(valid_coords)
-                    
-                    # Use closure to properly capture coordinates
-                    def make_freeze_hook(coords):
-                        def freeze_hook(grad):
-                            """Hook to zero gradients for frozen neurons."""
-                            if grad is not None:
-                                # Only zero specific coordinates, don't clone entire grad unless needed
-                                for row, col in coords:
-                                    if row < grad.shape[0] and col < grad.shape[1]:
-                                        grad[row, col] = 0.0
-                            return grad
-                        return freeze_hook
-                    
-                    # Register backward hook to zero gradients
-                    handle = weight.register_hook(make_freeze_hook(coords_tuple))
-                    hook_handles.append(handle)
-                    
-                    # Set requires_grad=False for the weight tensor
-                    # Note: For LoRA, the base model weights are typically frozen,
-                    # but we explicitly freeze these neurons anyway
-                    if weight.requires_grad:
-                        # Create a mask tensor for requires_grad
-                        # Since we can't set requires_grad per element, we rely on the hook
-                        pass
-                    
-                    print(f"Frozen {len(valid_coords)} neurons in {layer_name}")
+                # Store frozen rows for this module to freeze in LoRA adapters
+                if frozen_rows:
+                    frozen_rows_by_module[layer_name] = {
+                        'layer_idx': layer_idx,
+                        'module_path': module_path,
+                        'frozen_rows': frozen_rows,
+                        'weight_shape': weight.shape
+                    }
+                
+                print(f"Identified {len(valid_coords)} neurons to freeze in {layer_name} (affecting {len(frozen_rows)} rows)")
                     
             except (AttributeError, IndexError) as e:
                 print(f"Warning: Could not access {layer_name}: {e}")
                 continue
     
-    print(f"Total frozen neurons: {frozen_count}")
+    # Now freeze LoRA adapters to prevent updates to frozen neurons
+    print(f"\nFreezing LoRA adapters to prevent updates to frozen neurons...")
+    
+    # Access LoRA adapters through PEFT model structure
+    # PEFT stores LoRA adapters as parameters with names like:
+    # "base_model.model.layers.{i}.{module}.lora_A.weight" and "lora_B.weight"
+    lora_adapter_count = 0
+    
+    # Build a mapping of layer/module to LoRA adapter parameters
+    lora_adapters = {}
+    print("\nDebug: Scanning for LoRA adapters...")
+    lora_param_count = 0
+    sample_names = []
+    
+    for name, param in model.named_parameters():
+        if 'lora_B' in name or 'lora_A' in name:
+            lora_param_count += 1
+            if len(sample_names) < 5:  # Collect first 5 for debugging
+                sample_names.append((name, param.shape))
+            
+            # Parse the name to extract layer and module info
+            # Pattern: base_model.model.model.layers.{i}.{module}.lora_{A/B}.default.weight
+            parts = name.split('.')
+            try:
+                # Find the layer index
+                if 'layers' in parts:
+                    layer_idx_pos = parts.index('layers')
+                    if layer_idx_pos + 1 < len(parts):
+                        layer_idx = int(parts[layer_idx_pos + 1])
+                        # Find where lora_A or lora_B starts
+                        # Structure: ...layers.{i}.{module_path}.lora_{A/B}.default.weight
+                        lora_pos = None
+                        for i in range(layer_idx_pos + 2, len(parts)):
+                            if parts[i] in ['lora_A', 'lora_B']:
+                                lora_pos = i
+                                break
+                        
+                        if lora_pos is not None:
+                            # Module path is everything between layers.{i} and lora_{A/B}
+                            module_parts = parts[layer_idx_pos + 2:lora_pos]
+                            module_path = '.'.join(module_parts)
+                            
+                            lora_type = 'lora_A' if 'lora_A' in name else 'lora_B'
+                            key = (layer_idx, module_path)
+                            
+                            if key not in lora_adapters:
+                                lora_adapters[key] = {}
+                            lora_adapters[key][lora_type] = param
+            except (ValueError, IndexError) as e:
+                # Only print first few parsing errors to avoid spam
+                if len(sample_names) <= 5:
+                    print(f"  Warning: Failed to parse LoRA param '{name}': {e}")
+                continue
+    
+    print(f"  Total LoRA parameters found: {lora_param_count}")
+    print(f"  LoRA adapters mapped: {len(lora_adapters)}")
+    if sample_names:
+        print(f"  Sample LoRA parameter names:")
+        for name, shape in sample_names[:3]:
+            print(f"    {name}, shape: {shape}")
+    if lora_adapters:
+        print(f"  Sample adapter keys (layer_idx, module_path): {list(lora_adapters.keys())[:3]}")
+    
+    # Now freeze the LoRA adapters for modules with frozen neurons
+    for layer_name, module_info in frozen_rows_by_module.items():
+        layer_idx = module_info['layer_idx']
+        module_path = module_info['module_path']
+        frozen_rows = module_info['frozen_rows']
+        
+        try:
+            # Find the LoRA adapter for this layer/module
+            key = (layer_idx, module_path)
+            
+            if key in lora_adapters and 'lora_B' in lora_adapters[key]:
+                lora_B = lora_adapters[key]['lora_B']
+                
+                # Freeze rows in lora_B that correspond to frozen neurons
+                # lora_B shape: [out_features, r] where out_features matches weight.shape[0]
+                if lora_B.shape[0] == module_info['weight_shape'][0]:
+                    # Zero out and freeze the frozen rows in lora_B
+                    # Also register hooks to prevent gradient updates to these rows
+                    for row in frozen_rows:
+                        if row < lora_B.shape[0]:
+                            # Zero out the entire row in lora_B to prevent LoRA updates
+                            lora_B.data[row, :].zero_()
+                            
+                            # Create hook to prevent gradient updates to this row
+                            # This ensures that even if gradients are computed, they're zeroed out
+                            def make_lora_freeze_hook(frozen_row):
+                                def lora_freeze_hook(grad):
+                                    """Hook to zero gradients for frozen LoRA rows."""
+                                    if grad is not None:
+                                        grad = grad.clone()
+                                        grad[frozen_row, :] = 0.0
+                                    return grad
+                                return lora_freeze_hook
+                            
+                            # Register hook to zero gradients for this row
+                            # The hook will be called during backprop to ensure frozen rows don't get updated
+                            if lora_B.requires_grad:
+                                handle = lora_B.register_hook(make_lora_freeze_hook(row))
+                                hook_handles.append(handle)
+                    
+                    lora_adapter_count += 1
+                    print(f"  Frozen LoRA adapter for {layer_name}: zeroed {len(frozen_rows)} rows in lora_B")
+                else:
+                    print(f"  Warning: LoRA adapter shape mismatch for {layer_name}: expected {module_info['weight_shape'][0]}, got {lora_B.shape[0]}")
+            else:
+                # Check if this module is even targeted by LoRA (might not be in target_modules)
+                print(f"  Info: No LoRA adapter found for {layer_name} (module may not be targeted by LoRA)")
+                
+        except (AttributeError, IndexError, KeyError) as e:
+            print(f"  Warning: Could not freeze LoRA adapter for {layer_name}: {e}")
+            continue
+    
+    print(f"\nTotal frozen neurons: {frozen_count}")
+    print(f"Frozen LoRA adapters for {lora_adapter_count} modules")
     print(f"Registered {len(hook_handles)} gradient hooks")
     
     # Store hook handles in model for potential cleanup
@@ -186,6 +301,8 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
     # Clean up local variables to free memory
     del safety_neurons
     del base_model
+    del frozen_rows_by_module
+    del lora_adapters
     
     # Clear GPU cache after freezing to free up memory
     torch.cuda.empty_cache()
@@ -328,7 +445,7 @@ def main():
         "--save_steps",
         type=int,
         default=500,
-        help="Save checkpoint every N steps",
+        help="Save checkpoint every N steps (deprecated: not used, only final model is saved)",
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -352,7 +469,7 @@ def main():
     print(f"LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
     print(f"Training: {args.num_train_epochs} epochs, lr={args.learning_rate}")
     print(f"Output: {args.output_dir}")
-    print(f"Checkpoint every: {args.save_steps} steps")
+    print(f"Note: Only final model will be saved (no intermediate checkpoints)")
     if args.resume_from_checkpoint:
         print(f"Resuming from: {args.resume_from_checkpoint}")
     if args.freeze_safety_neurons:
@@ -400,12 +517,6 @@ def main():
     # Apply LoRA
     model = setup_lora(model, args.lora_r, args.lora_alpha)
     
-    # Enable gradient checkpointing on the base model to save memory
-    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
-        model.base_model.model.gradient_checkpointing_enable()
-    elif hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-    
     torch.cuda.empty_cache()  # Clear cache after LoRA setup
     print()
 
@@ -433,12 +544,12 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         logging_steps=10,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=3,  # Keep only last 3 checkpoints to save disk/memory
+        save_strategy="no",  # Don't save checkpoints during training, only save final model
         max_steps=args.max_steps,
         bf16=True,
-        gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+        # Disable gradient checkpointing when freezing neurons to avoid conflicts
+        # Gradient checkpointing with LoRA works, but can cause issues when freezing specific neurons
+        gradient_checkpointing=not args.freeze_safety_neurons,  # Disable when freezing
         remove_unused_columns=False,
         report_to="none",
     )

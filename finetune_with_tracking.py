@@ -145,6 +145,8 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                 valid_coords = []
                 frozen_rows = set()
                 
+                # Batch process all neuron coordinates for better performance
+                # Filter valid coordinates first
                 for coord in neuron_coords:
                     if len(coord) == 2:
                         row, col = coord
@@ -152,12 +154,23 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                         if row < weight.shape[0] and col < weight.shape[1]:
                             valid_coords.append((row, col))
                             frozen_rows.add(row)  # Track which rows need to be frozen
-                            # Store original weight value
-                            key = f"{layer_name}_{row}_{col}"
-                            original_weights[key] = weight.data[row, col].clone().cpu()  # Move to CPU immediately
                             frozen_count += 1
                         else:
                             print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight.shape}, skipping")
+                
+                # Batch extract all weights at once (much faster than individual operations)
+                if valid_coords:
+                    # Convert to tensors for indexing
+                    rows_tensor = torch.tensor([r for r, c in valid_coords], dtype=torch.long, device=weight.device)
+                    cols_tensor = torch.tensor([c for r, c in valid_coords], dtype=torch.long, device=weight.device)
+                    
+                    # Extract all weights in one vectorized operation
+                    weight_values = weight.data[rows_tensor, cols_tensor].float().cpu()
+                    
+                    # Store in original_weights dict
+                    for idx, (row, col) in enumerate(valid_coords):
+                        key = f"{layer_name}_{row}_{col}"
+                        original_weights[key] = weight_values[idx]
                 
                 # Store frozen rows for this module to freeze in LoRA adapters
                 if frozen_rows:
@@ -253,32 +266,35 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                 # Freeze rows in lora_B that correspond to frozen neurons
                 # lora_B shape: [out_features, r] where out_features matches weight.shape[0]
                 if lora_B.shape[0] == module_info['weight_shape'][0]:
-                    # Zero out and freeze the frozen rows in lora_B
-                    # Also register hooks to prevent gradient updates to these rows
-                    for row in frozen_rows:
-                        if row < lora_B.shape[0]:
-                            # Zero out the entire row in lora_B to prevent LoRA updates
-                            lora_B.data[row, :].zero_()
-                            
-                            # Create hook to prevent gradient updates to this row
-                            # This ensures that even if gradients are computed, they're zeroed out
-                            def make_lora_freeze_hook(frozen_row):
-                                def lora_freeze_hook(grad):
-                                    """Hook to zero gradients for frozen LoRA rows."""
-                                    if grad is not None:
-                                        grad = grad.clone()
-                                        grad[frozen_row, :] = 0.0
-                                    return grad
-                                return lora_freeze_hook
-                            
-                            # Register hook to zero gradients for this row
-                            # The hook will be called during backprop to ensure frozen rows don't get updated
-                            if lora_B.requires_grad:
-                                handle = lora_B.register_hook(make_lora_freeze_hook(row))
-                                hook_handles.append(handle)
+                    # Filter valid rows (within bounds)
+                    valid_frozen_rows = [row for row in frozen_rows if row < lora_B.shape[0]]
+                    
+                    if valid_frozen_rows:
+                        # Vectorized zeroing: zero all frozen rows at once (much faster)
+                        frozen_rows_tensor = torch.tensor(valid_frozen_rows, dtype=torch.long, device=lora_B.device)
+                        lora_B.data[frozen_rows_tensor, :] = 0.0
+                        
+                        # Create a single hook function that handles all frozen rows via set lookup
+                        # This is much more efficient than one hook per row
+                        frozen_rows_set = set(valid_frozen_rows)
+                        
+                        def lora_freeze_hook(grad):
+                            """Hook to zero gradients for all frozen LoRA rows."""
+                            if grad is not None:
+                                grad = grad.clone()
+                                # Vectorized: zero all frozen rows at once
+                                if len(frozen_rows_set) > 0:
+                                    frozen_rows_tensor_hook = torch.tensor(list(frozen_rows_set), dtype=torch.long, device=grad.device)
+                                    grad[frozen_rows_tensor_hook, :] = 0.0
+                            return grad
+                        
+                        # Register single hook for all frozen rows
+                        if lora_B.requires_grad:
+                            handle = lora_B.register_hook(lora_freeze_hook)
+                            hook_handles.append(handle)
                     
                     lora_adapter_count += 1
-                    print(f"  Frozen LoRA adapter for {layer_name}: zeroed {len(frozen_rows)} rows in lora_B")
+                    print(f"  Frozen LoRA adapter for {layer_name}: zeroed {len(valid_frozen_rows)} rows in lora_B")
                 else:
                     print(f"  Warning: LoRA adapter shape mismatch for {layer_name}: expected {module_info['weight_shape'][0]}, got {lora_B.shape[0]}")
             else:
@@ -315,7 +331,7 @@ def load_alpaca_dataset(tokenizer, max_length: int = 512):
     print("Loading Alpaca dataset...")
 
     # Load dataset from CSV file directly using datasets library
-    dataset = load_dataset("csv", data_files="data/alpaca_cleaned_on_safety_train.csv", split="train")
+    dataset = load_dataset("csv", data_files="data/alpaca_cleaned_no_safety_train.csv", split="train")
 
     def format_prompt(example):
         """Format Alpaca prompt from CSV data."""

@@ -148,15 +148,20 @@ def freeze_safety_critical_neurons(model, neuron_groups_file: str):
                 # Batch process all neuron coordinates for better performance
                 # Filter valid coordinates first
                 for coord in neuron_coords:
-                    if len(coord) == 2:
-                        row, col = coord
-                        # Bounds checking
-                        if row < weight.shape[0] and col < weight.shape[1]:
-                            valid_coords.append((row, col))
-                            frozen_rows.add(row)  # Track which rows need to be frozen
-                            frozen_count += 1
-                        else:
-                            print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight.shape}, skipping")
+                    # Handle both [row, col] and [row, col, score] formats
+                    if len(coord) >= 2:
+                        row, col = int(coord[0]), int(coord[1])
+                    else:
+                        print(f"Warning: Invalid coordinate format {coord} for {layer_name}, skipping")
+                        continue
+                    
+                    # Bounds checking
+                    if row < weight.shape[0] and col < weight.shape[1]:
+                        valid_coords.append((row, col))
+                        frozen_rows.add(row)  # Track which rows need to be frozen
+                        frozen_count += 1
+                    else:
+                        print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight.shape}, skipping")
                 
                 # Batch extract all weights at once (much faster than individual operations)
                 if valid_coords:

@@ -59,15 +59,24 @@ def normalize_layer_name(layer_name: str) -> str:
 
 def neuron_list_to_set(neurons: List[List[int]]) -> Set[Tuple[int, int]]:
     """
-    Convert a list of [row, col] neurons to a set of (row, col) tuples.
+    Convert a list of [row, col] or [row, col, score] neurons to a set of (row, col) tuples.
     
     Args:
-        neurons: List of [row, col] neuron coordinates
+        neurons: List of [row, col] or [row, col, score] neuron coordinates
         
     Returns:
         Set of (row, col) tuples
     """
-    return set((row, col) for row, col in neurons)
+    result = set()
+    for coord in neurons:
+        # Handle both [row, col] and [row, col, score] formats
+        if len(coord) >= 2:
+            row, col = int(coord[0]), int(coord[1])
+            result.add((row, col))
+        else:
+            # Skip invalid formats (shouldn't happen, but be defensive)
+            continue
+    return result
 
 
 def calculate_overlap_percentage(

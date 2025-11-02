@@ -66,7 +66,7 @@ def extract_neuron_weights(
 
     Args:
         model: PyTorch model
-        neuron_groups: Dict mapping layer_name to list of [row, col] coordinates
+        neuron_groups: Dict mapping layer_name to list of [row, col] or [row, col, score] coordinates
         device: Device to store tensors
 
     Returns:
@@ -94,7 +94,14 @@ def extract_neuron_weights(
                 weight_matrix = module.weight.data
 
                 # Extract specific neuron weights
-                for row, col in neuron_coords:
+                for coord in neuron_coords:
+                    # Handle both [row, col] and [row, col, score] formats
+                    if len(coord) >= 2:
+                        row, col = int(coord[0]), int(coord[1])
+                    else:
+                        print(f"Warning: Invalid coordinate format {coord} for {layer_name}, skipping")
+                        continue
+                    
                     # Bounds checking
                     if row >= weight_matrix.shape[0] or col >= weight_matrix.shape[1]:
                         print(f"Warning: ({row}, {col}) out of bounds for {layer_name} shape {weight_matrix.shape}, skipping")
@@ -227,7 +234,14 @@ def aggregate_by_group(
         group_values = []
 
         for layer_name, neuron_coords in group_neurons.items():
-            for row, col in neuron_coords:
+            for coord in neuron_coords:
+                # Handle both [row, col] and [row, col, score] formats
+                if len(coord) >= 2:
+                    row, col = int(coord[0]), int(coord[1])
+                else:
+                    print(f"Warning: Invalid coordinate format {coord} for {layer_name}, skipping")
+                    continue
+                    
                 key = f"{layer_name}_{row}_{col}"
                 if key in metrics:
                     group_values.append(metrics[key])

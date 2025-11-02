@@ -282,33 +282,50 @@ def get_random_neurons_per_layer(
     return result
 
 
-def save_neuron_groups(
+def save_neuron_scores(
     neurons: List[Tuple[str, int, int]],
+    scores_dict: Dict[str, torch.Tensor],
     output_path: str
 ):
     """
-    Save neuron groups to JSON file.
-
+    Save SNIP scores for identified neurons to a separate JSON file.
+    
     Format: {
-        "layer_0_self_attn.q_proj": [[row, col], ...],
-        "layer_1_mlp.down_proj": [[row, col], ...],
+        "layer_0_self_attn.q_proj": [[row, col, score], ...],
+        "layer_1_mlp.down_proj": [[row, col, score], ...],
         ...
     }
+    
+    Args:
+        neurons: List of (layer_name, row, col) tuples
+        scores_dict: Dictionary mapping layer_name to score tensor
+        output_path: Path to save scores JSON file
     """
     # Group by layer
     grouped = {}
     for layer_name, row, col in neurons:
         if layer_name not in grouped:
             grouped[layer_name] = []
-        grouped[layer_name].append([row, col])
-
+        
+        # Get score for this neuron
+        if layer_name in scores_dict:
+            score_tensor = scores_dict[layer_name]
+            if score_tensor.is_cuda:
+                score_tensor = score_tensor.cpu()
+            # Convert to float and extract value
+            score_value = float(score_tensor[row, col].item())
+            grouped[layer_name].append([row, col, score_value])
+        else:
+            # If layer not found, save with score 0 as fallback
+            grouped[layer_name].append([row, col, 0.0])
+    
     # Save to JSON
     with open(output_path, "w") as f:
         json.dump(grouped, f, indent=2)
-
-    print(f"Saved neuron groups to {output_path}")
+    
+    print(f"Saved neuron scores to {output_path}")
     print(f"  Total layers: {len(grouped)}")
-    print(f"  Total neurons: {sum(len(v) for v in grouped.values())}")
+    print(f"  Total neurons with scores: {sum(len(v) for v in grouped.values())}")
 
 
 def main():
@@ -424,7 +441,7 @@ def main():
         print("1. Identifying safety-critical neurons (SNIP top-k)...")
         print("=" * 60)
         safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
-        save_neuron_groups(
+        save_neuron_scores(
             safety_topk,
             os.path.join(args.output_dir, "neuron_groups_top_safety.json")
         )
@@ -439,7 +456,7 @@ def main():
         set_diff_neurons = get_set_difference_neurons(
             safety_scores, utility_scores, args.set_diff_p, args.set_diff_q
         )
-        save_neuron_groups(
+        save_neuron_scores(
             set_diff_neurons,
             os.path.join(args.output_dir, "neuron_groups_set_diff.json")
         )
@@ -452,7 +469,7 @@ def main():
         print("3. Identifying utility-critical neurons...")
         print("=" * 60)
         utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
-        save_neuron_groups(
+        save_neuron_scores(
             utility_topk,
             os.path.join(args.output_dir, "neuron_groups_top_utility.json")
         )
@@ -467,7 +484,7 @@ def main():
         random_neurons = get_random_neurons_per_layer(
             safety_scores, args.snip_top_k, args.seed
         )
-        save_neuron_groups(
+        save_neuron_scores(
             random_neurons,
             os.path.join(args.output_dir, "neuron_groups_random.json")
         )

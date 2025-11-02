@@ -34,15 +34,15 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
     Returns:
         Dictionary mapping layer_name to score tensor
     """
-    wanda_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
+    snip_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
 
-    if not os.path.exists(wanda_score_dir):
-        raise FileNotFoundError(f"Score directory not found: {wanda_score_dir}")
+    if not os.path.exists(snip_score_dir):
+        raise FileNotFoundError(f"Score directory not found: {snip_score_dir}")
 
     scores = {}
-    score_files = sorted(Path(wanda_score_dir).glob("W_metric_layer_*.pkl"))
+    score_files = sorted(Path(snip_score_dir).glob("W_metric_layer_*.pkl"))
 
-    print(f"Loading SNIP scores from {wanda_score_dir}")
+    print(f"Loading SNIP scores from {snip_score_dir}")
     print(f"Found {len(score_files)} score files")
 
     for score_file in score_files:
@@ -322,10 +322,30 @@ def main():
         help="Base directory containing SNIP scores"
     )
     parser.add_argument(
+        "--safety_dataset",
+        type=str,
+        default="align",
+        help="Safety dataset name"
+    )
+    parser.add_argument(
+        "--utility_dataset",
+        type=str,
+        default="alpaca_cleaned_no_safety",
+        help="Utility dataset name"
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="neuron_groups",
         help="Output directory for neuron group files"
+    )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        nargs="+",
+        choices=["top_safety", "top_utility", "set_difference", "random"],
+        default=["top_safety", "top_utility", "set_difference", "random"],
+        help="Method(s) to run: top_safety, top_utility, set_difference, random (default: all)"
     )
     parser.add_argument(
         "--snip_top_k",
@@ -353,6 +373,9 @@ def main():
     )
 
     args = parser.parse_args()
+    
+    # Convert method to set for easier checking
+    methods = set(args.methods)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -362,81 +385,107 @@ def main():
     print("=" * 60)
     print(f"Score base directory: {args.score_base_dir}")
     print(f"Output directory: {args.output_dir}")
+    print(f"Methods: {', '.join(sorted(methods))}")
     print(f"SNIP top-k: {args.snip_top_k}")
     print(f"Set diff p: {args.set_diff_p}, q: {args.set_diff_q}")
     print()
 
-    # Load SNIP scores
-    print("Loading safety SNIP scores...")
-    safety_scores = load_snip_scores(args.score_base_dir, "align")
-    print()
+    # Determine which scores to load
+    need_safety = "top_safety" in methods or "set_difference" in methods or "random" in methods
+    need_utility = "top_utility" in methods or "set_difference" in methods
 
-    print("Loading utility SNIP scores...")
-    utility_scores = load_snip_scores(args.score_base_dir, "alpaca_cleaned_no_safety")
-    print()
+    # Load SNIP scores (only if needed)
+    safety_scores = None
+    utility_scores = None
+    
+    if need_safety:
+        print("Loading safety SNIP scores...")
+        safety_scores = load_snip_scores(args.score_base_dir, args.safety_dataset)
+        print()
 
-    # Verify same layers in both
-    if set(safety_scores.keys()) != set(utility_scores.keys()):
-        print("WARNING: Safety and utility scores have different layers!")
-        print(f"  Safety layers: {len(safety_scores)}")
-        print(f"  Utility layers: {len(utility_scores)}")
+    if need_utility:
+        print("Loading utility SNIP scores...")
+        utility_scores = load_snip_scores(args.score_base_dir, args.utility_dataset)
+        print()
+
+    # Verify same layers in both (if both are loaded)
+    if safety_scores is not None and utility_scores is not None:
+        if set(safety_scores.keys()) != set(utility_scores.keys()):
+            print("WARNING: Safety and utility scores have different layers!")
+            print(f"  Safety layers: {len(safety_scores)}")
+            print(f"  Utility layers: {len(utility_scores)}")
+
+    # Track results for summary
+    results = {}
 
     # 1. Safety-critical (SNIP top-k)
-    print("=" * 60)
-    print("1. Identifying safety-critical neurons (SNIP top-k)...")
-    print("=" * 60)
-    safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
-    save_neuron_groups(
-        safety_topk,
-        os.path.join(args.output_dir, "neuron_groups_snip_top.json")
-    )
-    print()
+    if "top_safety" in methods:
+        print("=" * 60)
+        print("1. Identifying safety-critical neurons (SNIP top-k)...")
+        print("=" * 60)
+        safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
+        save_neuron_groups(
+            safety_topk,
+            os.path.join(args.output_dir, "neuron_groups_top_safety.json")
+        )
+        results["top_safety"] = len(safety_topk)
+        print()
 
     # 2. Safety-critical (Set difference)
-    print("=" * 60)
-    print("2. Identifying safety-critical neurons (Set difference)...")
-    print("=" * 60)
-    set_diff_neurons = get_set_difference_neurons(
-        safety_scores, utility_scores, args.set_diff_p, args.set_diff_q
-    )
-    save_neuron_groups(
-        set_diff_neurons,
-        os.path.join(args.output_dir, "neuron_groups_set_diff.json")
-    )
-    print()
+    if "set_difference" in methods:
+        print("=" * 60)
+        print("2. Identifying safety-critical neurons (Set difference)...")
+        print("=" * 60)
+        set_diff_neurons = get_set_difference_neurons(
+            safety_scores, utility_scores, args.set_diff_p, args.set_diff_q
+        )
+        save_neuron_groups(
+            set_diff_neurons,
+            os.path.join(args.output_dir, "neuron_groups_set_diff.json")
+        )
+        results["set_difference"] = len(set_diff_neurons)
+        print()
 
     # 3. Utility-critical
-    print("=" * 60)
-    print("3. Identifying utility-critical neurons...")
-    print("=" * 60)
-    utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
-    save_neuron_groups(
-        utility_topk,
-        os.path.join(args.output_dir, "neuron_groups_utility.json")
-    )
-    print()
+    if "top_utility" in methods:
+        print("=" * 60)
+        print("3. Identifying utility-critical neurons...")
+        print("=" * 60)
+        utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
+        save_neuron_groups(
+            utility_topk,
+            os.path.join(args.output_dir, "neuron_groups_top_utility.json")
+        )
+        results["top_utility"] = len(utility_topk)
+        print()
 
     # 4. Random (same percentage per layer as safety SNIP top-k)
-    print("=" * 60)
-    print("4. Identifying random neurons (baseline)...")
-    print("=" * 60)
-    random_neurons = get_random_neurons_per_layer(
-        safety_scores, args.snip_top_k, args.seed
-    )
-    save_neuron_groups(
-        random_neurons,
-        os.path.join(args.output_dir, "neuron_groups_random.json")
-    )
-    print()
+    if "random" in methods:
+        print("=" * 60)
+        print("4. Identifying random neurons (baseline)...")
+        print("=" * 60)
+        random_neurons = get_random_neurons_per_layer(
+            safety_scores, args.snip_top_k, args.seed
+        )
+        save_neuron_groups(
+            random_neurons,
+            os.path.join(args.output_dir, "neuron_groups_random.json")
+        )
+        results["random"] = len(random_neurons)
+        print()
 
     print("=" * 60)
     print("Neuron Group Identification Complete!")
     print("=" * 60)
     print(f"Output files in {args.output_dir}:")
-    print(f"  - neuron_groups_snip_top.json    ({len(safety_topk)} neurons)")
-    print(f"  - neuron_groups_set_diff.json    ({len(set_diff_neurons)} neurons)")
-    print(f"  - neuron_groups_utility.json     ({len(utility_topk)} neurons)")
-    print(f"  - neuron_groups_random.json      ({len(random_neurons)} neurons)")
+    if "top_safety" in results:
+        print(f"  - neuron_groups_snip_top.json    ({results['top_safety']:,} neurons)")
+    if "set_difference" in results:
+        print(f"  - neuron_groups_set_difference.json    ({results['set_difference']:,} neurons)")
+    if "top_utility" in results:
+        print(f"  - neuron_groups_utility.json     ({results['top_utility']:,} neurons)")
+    if "random" in results:
+        print(f"  - neuron_groups_random.json      ({results['random']:,} neurons)")
 
 
 if __name__ == "__main__":

@@ -34,15 +34,15 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
     Returns:
         Dictionary mapping layer_name to score tensor
     """
-    snip_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
+    wanda_score_dir = os.path.join(score_dir, dataset_name, "wanda_score")
 
-    if not os.path.exists(snip_score_dir):
-        raise FileNotFoundError(f"Score directory not found: {snip_score_dir}")
+    if not os.path.exists(wanda_score_dir):
+        raise FileNotFoundError(f"Score directory not found: {wanda_score_dir}")
 
     scores = {}
-    score_files = sorted(Path(snip_score_dir).glob("W_metric_layer_*.pkl"))
+    score_files = sorted(Path(wanda_score_dir).glob("W_metric_layer_*.pkl"))
 
-    print(f"Loading SNIP scores from {snip_score_dir}")
+    print(f"Loading SNIP scores from {wanda_score_dir}")
     print(f"Found {len(score_files)} score files")
 
     for score_file in score_files:
@@ -64,13 +64,13 @@ def load_snip_scores(score_dir: str, dataset_name: str) -> Dict[str, torch.Tenso
             name_end = len(filename)
         module_name = filename[name_start:name_end]
 
-        # Create unique key
-        key = f"layer_{layer_idx}_{module_name}"
-
         # Strip redundant "model.layers.{i}." prefix for compatibility with drift tracking
         # SNIP scores have full paths like "model.layers.0.self_attn.q_proj"
         # But we want keys like "layer_0_self_attn.q_proj"
         module_name = module_name.replace(f"model.layers.{layer_idx}.", "")
+
+        # Create unique key
+        key = f"layer_{layer_idx}_{module_name}"
 
         # Load score tensor
         with open(score_file, "rb") as f:
@@ -226,57 +226,60 @@ def get_set_difference_neurons(
     return result
 
 
-def get_random_neurons(
+def get_random_neurons_per_layer(
     scores: Dict[str, torch.Tensor],
-    num_neurons: int,
+    k: float,
     seed: int = 0
 ) -> List[Tuple[str, int, int]]:
     """
-    Get random sample of neurons using memory-efficient sampling.
-    Does not materialize the full index space.
+    Get random sample of neurons per layer (matching SNIP/utility methodology).
+
+    This samples k% of neurons from EACH layer independently, ensuring
+    consistent methodology with safety and utility neuron identification.
 
     Args:
         scores: Dictionary mapping layer_name to score tensor (for dimensions)
-        num_neurons: Number of neurons to sample
+        k: Fraction of neurons to sample per layer (e.g., 0.01 for 1%)
         seed: Random seed
 
     Returns:
         List of (layer_name, row, col) tuples for random neurons
     """
     np.random.seed(seed)
-
-    # Calculate layer sizes without materializing indices
-    layer_info = []
+    result = []
     total_neurons = 0
 
-    for layer_name, score in sorted(scores.items()):
-        n = score.numel()
-        # Store: (layer_name, shape, offset, size)
-        layer_info.append((layer_name, score.shape, total_neurons, n))
-        total_neurons += n
+    print(f"Selecting random {k*100:.1f}% neurons per layer...")
 
-    print(f"Total neurons: {total_neurons:,}, sampling {num_neurons:,} random neurons")
+    for layer_name, score in tqdm(sorted(scores.items()), desc="Sampling random neurons"):
+        # Ensure tensor is on CPU for memory efficiency
+        if score.is_cuda:
+            score = score.cpu()
 
-    # Sample global indices
-    sampled_global_indices = np.random.choice(total_neurons, num_neurons, replace=False)
+        # Calculate how many neurons to sample from this layer
+        layer_size = score.numel()
+        layer_k = max(1, int(layer_size * k))
+        layer_k = min(layer_k, layer_size)
 
-    # Convert to (layer, row, col) without full materialization
-    sampled_neurons = []
+        if layer_k == 0:
+            continue
 
-    for global_idx in sorted(sampled_global_indices):
-        # Find which layer this index belongs to
-        for layer_name, shape, offset, size in layer_info:
-            if offset <= global_idx < offset + size:
-                # Convert global index to local index within this layer
-                local_idx = global_idx - offset
-                row = local_idx // shape[1]
-                col = local_idx % shape[1]
-                sampled_neurons.append((layer_name, int(row), int(col)))
-                break
+        # Sample random indices for this layer only
+        random_indices = np.random.choice(layer_size, layer_k, replace=False)
 
-    print(f"Sampled {len(sampled_neurons)} random neurons")
+        # Convert flat indices to row/col
+        rows = random_indices // score.shape[1]
+        cols = random_indices % score.shape[1]
 
-    return sampled_neurons
+        # Add to result
+        for row, col in zip(rows, cols):
+            result.append((layer_name, int(row), int(col)))
+
+        total_neurons += len(random_indices)
+
+    print(f"Selected {total_neurons:,} random neurons total ({k*100:.1f}% per layer)")
+
+    return result
 
 
 def save_neuron_groups(
@@ -319,18 +322,6 @@ def main():
         help="Base directory containing SNIP scores"
     )
     parser.add_argument(
-        "--safety_dataset",
-        type=str,
-        default="align",
-        help="Safety dataset name"
-    )
-    parser.add_argument(
-        "--utility_dataset",
-        type=str,
-        default="alpaca_cleaned_no_safety",
-        help="Utility dataset name"
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="neuron_groups",
@@ -360,20 +351,8 @@ def main():
         default=0,
         help="Random seed for random neuron selection"
     )
-    parser.add_argument(
-        "--methods",
-        type=str,
-        nargs='+',
-        choices=['top_safety', 'top_utility', 'set_difference', 'random'],
-        default=['top_safety', 'top_utility', 'set_difference', 'random'],
-        help="Methods to run: top_safety, top_utility, set_difference, random. "
-             "Can specify multiple (default: all methods)"
-    )
 
     args = parser.parse_args()
-
-    # Convert methods to set for efficient checking
-    methods_to_run = set(args.methods)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -385,110 +364,79 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"SNIP top-k: {args.snip_top_k}")
     print(f"Set diff p: {args.set_diff_p}, q: {args.set_diff_q}")
-    print(f"Methods to run: {', '.join(sorted(methods_to_run))}")
     print()
 
-    # Load SNIP scores (only load what's needed)
-    needs_safety = methods_to_run & {'top_safety', 'set_difference', 'random'}
-    needs_utility = methods_to_run & {'top_utility', 'set_difference'}
-    
-    safety_scores = None
-    utility_scores = None
-    
-    if needs_safety:
-        print("Loading safety SNIP scores...")
-        safety_scores = load_snip_scores(args.score_base_dir, args.safety_dataset)
-        print()
+    # Load SNIP scores
+    print("Loading safety SNIP scores...")
+    safety_scores = load_snip_scores(args.score_base_dir, "align")
+    print()
 
-    if needs_utility:
-        print("Loading utility SNIP scores...")
-        utility_scores = load_snip_scores(args.score_base_dir, args.utility_dataset)
-        print()
+    print("Loading utility SNIP scores...")
+    utility_scores = load_snip_scores(args.score_base_dir, "alpaca_cleaned_no_safety")
+    print()
 
-    # Verify same layers in both (if both loaded)
-    if safety_scores and utility_scores:
-        if set(safety_scores.keys()) != set(utility_scores.keys()):
-            print("WARNING: Safety and utility scores have different layers!")
-            print(f"  Safety layers: {len(safety_scores)}")
-            print(f"  Utility layers: {len(utility_scores)}")
-
-    # Track completed methods for summary
-    safety_topk = None
-    completed_methods = {}
+    # Verify same layers in both
+    if set(safety_scores.keys()) != set(utility_scores.keys()):
+        print("WARNING: Safety and utility scores have different layers!")
+        print(f"  Safety layers: {len(safety_scores)}")
+        print(f"  Utility layers: {len(utility_scores)}")
 
     # 1. Safety-critical (SNIP top-k)
-    if 'top_safety' in methods_to_run:
-        print("=" * 60)
-        print("1. Identifying safety-critical neurons (SNIP top-k)...")
-        print("=" * 60)
-        safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
-        save_neuron_groups(
-            safety_topk,
-            os.path.join(args.output_dir, "neuron_groups_safety.json")
-        )
-        completed_methods['top_safety'] = len(safety_topk)
-        print()
+    print("=" * 60)
+    print("1. Identifying safety-critical neurons (SNIP top-k)...")
+    print("=" * 60)
+    safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
+    save_neuron_groups(
+        safety_topk,
+        os.path.join(args.output_dir, "neuron_groups_snip_top.json")
+    )
+    print()
 
     # 2. Safety-critical (Set difference)
-    if 'set_difference' in methods_to_run:
-        print("=" * 60)
-        print("2. Identifying safety-critical neurons (Set difference)...")
-        print("=" * 60)
-        set_diff_neurons = get_set_difference_neurons(
-            safety_scores, utility_scores, args.set_diff_p, args.set_diff_q
-        )
-        save_neuron_groups(
-            set_diff_neurons,
-            os.path.join(args.output_dir, "neuron_groups_set_diff.json")
-        )
-        completed_methods['set_difference'] = len(set_diff_neurons)
-        print()
+    print("=" * 60)
+    print("2. Identifying safety-critical neurons (Set difference)...")
+    print("=" * 60)
+    set_diff_neurons = get_set_difference_neurons(
+        safety_scores, utility_scores, args.set_diff_p, args.set_diff_q
+    )
+    save_neuron_groups(
+        set_diff_neurons,
+        os.path.join(args.output_dir, "neuron_groups_set_diff.json")
+    )
+    print()
 
     # 3. Utility-critical
-    if 'top_utility' in methods_to_run:
-        print("=" * 60)
-        print("3. Identifying utility-critical neurons...")
-        print("=" * 60)
-        utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
-        save_neuron_groups(
-            utility_topk,
-            os.path.join(args.output_dir, "neuron_groups_utility.json")
-        )
-        completed_methods['top_utility'] = len(utility_topk)
-        print()
+    print("=" * 60)
+    print("3. Identifying utility-critical neurons...")
+    print("=" * 60)
+    utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
+    save_neuron_groups(
+        utility_topk,
+        os.path.join(args.output_dir, "neuron_groups_utility.json")
+    )
+    print()
 
-    # 4. Random (same size as safety SNIP top-k)
-    if 'random' in methods_to_run:
-        print("=" * 60)
-        print("4. Identifying random neurons (baseline)...")
-        print("=" * 60)
-        # Random needs safety_topk size - compute it if not already done
-        if safety_topk is None:
-            safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
-        
-        random_neurons = get_random_neurons(
-            safety_scores, len(safety_topk), args.seed
-        )
-        save_neuron_groups(
-            random_neurons,
-            os.path.join(args.output_dir, "neuron_groups_random.json")
-        )
-        completed_methods['random'] = len(random_neurons)
-        print()
+    # 4. Random (same percentage per layer as safety SNIP top-k)
+    print("=" * 60)
+    print("4. Identifying random neurons (baseline)...")
+    print("=" * 60)
+    random_neurons = get_random_neurons_per_layer(
+        safety_scores, args.snip_top_k, args.seed
+    )
+    save_neuron_groups(
+        random_neurons,
+        os.path.join(args.output_dir, "neuron_groups_random.json")
+    )
+    print()
 
     print("=" * 60)
     print("Neuron Group Identification Complete!")
     print("=" * 60)
     print(f"Output files in {args.output_dir}:")
-    
-    if 'top_safety' in completed_methods:
-        print(f"  - neuron_groups_safety.json    ({completed_methods['top_safety']} neurons)")
-    if 'set_difference' in completed_methods:
-        print(f"  - neuron_groups_set_diff.json    ({completed_methods['set_difference']} neurons)")
-    if 'top_utility' in completed_methods:
-        print(f"  - neuron_groups_utility.json     ({completed_methods['top_utility']} neurons)")
-    if 'random' in completed_methods:
-        print(f"  - neuron_groups_random.json      ({completed_methods['random']} neurons)")
+    print(f"  - neuron_groups_snip_top.json    ({len(safety_topk)} neurons)")
+    print(f"  - neuron_groups_set_diff.json    ({len(set_diff_neurons)} neurons)")
+    print(f"  - neuron_groups_utility.json     ({len(utility_topk)} neurons)")
+    print(f"  - neuron_groups_random.json      ({len(random_neurons)} neurons)")
 
 
 if __name__ == "__main__":

@@ -20,8 +20,6 @@ from datasets import load_dataset
 from lib.drift_utils import (
     load_neuron_groups,
     extract_neuron_weights,
-    compute_drift_metrics,
-    save_drift_log,
 )
 
 
@@ -190,34 +188,36 @@ def main():
         help="Directory containing neuron group JSON files",
     )
     parser.add_argument(
-        "--drift_log_dir",
-        type=str,
-        default="/dev/shm/drift_logs",
-        help="Directory to save drift logs (use /dev/shm for large files)",
-    )
-    parser.add_argument(
-        "--drift_log_interval",
-        type=int,
-        default=100,
-        help="Steps between drift measurements",
-    )
-    parser.add_argument(
         "--initial_weights_dir",
         type=str,
         default="/dev/shm/initial_weights",
-        help="Directory to save initial weights (use /dev/shm for large files)",
+        help="Directory to save initial weights (needed for drift computation)",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,
+        help="Save checkpoint every N steps",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (e.g., finetuned_models/checkpoint-1000)",
     )
 
     args = parser.parse_args()
 
     print("=" * 70)
-    print("Fine-Tuning with LoRA and Drift Tracking")
+    print("Fine-Tuning with LoRA")
     print("=" * 70)
     print(f"Model: {args.model_name}")
     print(f"LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
     print(f"Training: {args.num_train_epochs} epochs, lr={args.learning_rate}")
     print(f"Output: {args.output_dir}")
-    print(f"Drift logs: {args.drift_log_dir}")
+    print(f"Checkpoint every: {args.save_steps} steps")
+    if args.resume_from_checkpoint:
+        print(f"Resuming from: {args.resume_from_checkpoint}")
     print()
 
     # Load model and tokenizer
@@ -230,9 +230,13 @@ def main():
 
     # Extract and save initial weights (before LoRA)
     print("Extracting initial weights...")
+    # Merge all neuron groups into a single dict, combining coords for overlapping layers
     all_neurons = {}
     for group_name, group_data in neuron_groups.items():
-        all_neurons.update(group_data)
+        for layer_name, coords in group_data.items():
+            if layer_name not in all_neurons:
+                all_neurons[layer_name] = []
+            all_neurons[layer_name].extend(coords)
 
     initial_weights = extract_neuron_weights(model, all_neurons, device="cuda")
 
@@ -261,7 +265,8 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=10,
         save_strategy="steps",
-        save_steps=500,
+        save_steps=args.save_steps,
+        save_total_limit=None,  # Keep all checkpoints (don't auto-delete old ones)
         max_steps=args.max_steps,
         bf16=True,
         remove_unused_columns=False,
@@ -275,48 +280,14 @@ def main():
         train_dataset=train_dataset,
     )
 
-    # Add drift tracking callback
-    # Note: HuggingFace Trainer callbacks need to inherit from TrainerCallback
-    # For simplicity, we'll track drift manually at save checkpoints
+    # Train (drift will be computed separately in Phase 2b)
     print("=" * 70)
     print("Starting training...")
     print("=" * 70)
-
-    # Compute initial drift (should be ~zero, sanity check)
-    print("Computing initial drift (sanity check)...")
-    drift_metrics = compute_drift_metrics(
-        model.get_base_model(),  # Base model before any LoRA training
-        initial_weights,
-        neuron_groups,
-        device="cuda",
-    )
-    save_drift_log(drift_metrics, 0, args.drift_log_dir)
-
-    # Print sanity check results
-    for metric_name, metric_data in drift_metrics.items():
-        print(f"\nInitial {metric_name}:")
-        for group_name, stats in metric_data.items():
-            print(f"  {group_name}: mean={stats['mean']:.6f}, max={stats['max']:.6f}")
+    print("Note: Drift computation will be done post-training using compute_drift.py")
     print()
 
-    # Train
-    trainer.train()
-
-    # Compute final drift
-    print("\nComputing final drift...")
-
-    # IMPORTANT: Merge LoRA weights into base model to get effective weights
-    # Without this, we'd only measure frozen base weights (which don't change during LoRA)
-    print("Merging LoRA weights into base model...")
-    model = model.merge_and_unload()
-
-    drift_metrics = compute_drift_metrics(
-        model,  # Now contains W + LoRA modifications
-        initial_weights,
-        neuron_groups,
-        device="cuda",
-    )
-    save_drift_log(drift_metrics, trainer.state.global_step, args.drift_log_dir)
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     # Save final model
     print(f"\nSaving final model to {args.output_dir}...")
@@ -326,9 +297,10 @@ def main():
     print("=" * 70)
     print("Training Complete!")
     print("=" * 70)
-    print(f"Model saved to: {args.output_dir}")
-    print(f"Drift logs saved to: {args.drift_log_dir}")
+    print(f"Model checkpoints saved to: {args.output_dir}")
     print(f"Initial weights saved to: {initial_weights_path}")
+    print()
+    print("Next step: Run compute_drift.py to compute drift for all checkpoints")
 
 
 if __name__ == "__main__":

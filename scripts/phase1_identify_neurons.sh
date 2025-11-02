@@ -36,7 +36,7 @@ python identify_neuron_groups.py \
     --snip_top_k "${SNIP_TOP_K}" \
     --set_diff_p "${SET_DIFF_P}" \
     --set_diff_q "${SET_DIFF_Q}" \
-    --methods ${METHODS}
+    --methods ${METHODS} \
     --seed 0
 
 echo ""

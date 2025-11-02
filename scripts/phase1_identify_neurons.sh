@@ -5,7 +5,7 @@
 set -e  # Exit on error
 
 # Configuration
-SCORE_BASE_DIR="/tmp/snip_scores"
+SCORE_BASE_DIR="outputs/snip_scores"
 OUTPUT_DIR="outputs/neuron_groups"
 SAFETY_DATASET="align_short"
 UTILITY_DATASET="alpaca_cleaned_no_safety"

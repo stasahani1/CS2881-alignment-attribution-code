@@ -6,15 +6,14 @@ set -e  # Exit on error
 
 # Configuration
 MODEL="llama2-7b-chat-hf"
-CACHE_DIR="models/llama-2-7b-chat-hf"  # Use pre-downloaded models
+CACHE_DIR="models/huggingface/hub"  # Use pre-downloaded models
 METHOD="wandg"  # SNIP method
 SPARSITY_RATIO=0.01  # Not used for scoring, but required parameter
 NSAMPLES=128  # Number of calibration samples
 SEED=0
 
-# Output directories (using /dev/shm for large temporary files)
-# SCORE_BASE_DIR="/dev/shm/snip_scores"
-SCORE_BASE_DIR="/tmp/snip_scores"
+# Output directories
+SCORE_BASE_DIR="outputs/snip_scores"
 SAFETY_DATASET="align_short"
 UTILITY_DATASET="alpaca_cleaned_no_safety"
 SAFETY_SCORE_DIR="${SCORE_BASE_DIR}/${SAFETY_DATASET}"

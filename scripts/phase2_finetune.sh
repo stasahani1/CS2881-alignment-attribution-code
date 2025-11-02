@@ -21,10 +21,10 @@ MAX_STEPS=-1  # -1 for full training, set to smaller number for testing
 # Note: No intermediate checkpoints saved, only final model at end
 
 # Paths
-NEURON_GROUPS_DIR="/workspace/CS2881-alignment-attribution-code/outputs/neuron_groups"
-OUTPUT_DIR="/workspace/CS2881-alignment-attribution-code/finetuned_models"
-DRIFT_LOG_DIR="/dev/shm/drift_logs"
-INITIAL_WEIGHTS_DIR="/dev/shm/initial_weights"
+NEURON_GROUPS_DIR="outputs/neuron_groups"
+OUTPUT_DIR="models/finetuned_models"
+DRIFT_LOG_DIR="outputs/drift_logs"
+INITIAL_WEIGHTS_DIR="outputs/initial_weights"
 DRIFT_LOG_INTERVAL=100  # Compute drift every 100 steps
 
 # Freezing configuration (optional)

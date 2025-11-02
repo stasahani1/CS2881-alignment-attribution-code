@@ -38,7 +38,7 @@ modeltype2path = {
     "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
 }
 
-def get_llm(model_name, cache_dir="llm_weights"):
+def get_llm(model_name, cache_dir="models/huggingface/hub"):
     if model_name in [
         "llama2-7b-chat-hf",
         "llama2-13b-chat-hf",
@@ -52,8 +52,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             use_safetensors=False,  # Use .bin files only
-            local_files_only=True,   # Use cached files (in /dev/shm/huggingface/)
-            cache_dir="/dev/shm/huggingface/hub",  # Explicitly set cache directory
+            local_files_only=True,   # Use cached files (in models/huggingface/)
+            cache_dir=cache_dir,  # Explicitly set cache directory
         )
         # Move to GPU manually
         model = model.to('cuda:0')
@@ -160,7 +160,7 @@ def main():
         help="Use combined with attention_head, the top k heads to prune",
     )
 
-    parser.add_argument("--cache_dir", default="llm_weights", type=str)
+    parser.add_argument("--cache_dir", default="models/huggingface/hub", type=str)
     parser.add_argument(
         "--use_variant",
         action="store_true",

@@ -22,9 +22,8 @@ MAX_STEPS=-1  # -1 for full training, set to smaller number for testing
 # Paths
 NEURON_GROUPS_DIR="/workspace/CS2881-alignment-attribution-code/neuron_groups"
 OUTPUT_DIR="/workspace/CS2881-alignment-attribution-code/finetuned_models"
-DRIFT_LOG_DIR="/dev/shm/drift_logs"
 INITIAL_WEIGHTS_DIR="/dev/shm/initial_weights"
-DRIFT_LOG_INTERVAL=100  # Compute drift every 100 steps
+SAVE_STEPS=500  # Save checkpoint every 500 steps
 
 echo "================================================"
 echo "Phase 2: Fine-Tuning with LoRA"
@@ -37,13 +36,12 @@ echo "Max steps: ${MAX_STEPS}"
 echo ""
 echo "Output:"
 echo "  Model: ${OUTPUT_DIR}"
-echo "  Drift logs: ${DRIFT_LOG_DIR}"
 echo "  Initial weights: ${INITIAL_WEIGHTS_DIR}"
+echo "  Checkpoint every: ${SAVE_STEPS} steps"
 echo ""
 
 # Create output directories
 mkdir -p "${OUTPUT_DIR}"
-mkdir -p "${DRIFT_LOG_DIR}"
 mkdir -p "${INITIAL_WEIGHTS_DIR}"
 
 # Check that neuron groups exist
@@ -67,15 +65,14 @@ python finetune_with_tracking.py \
     --max_length "${MAX_LENGTH}" \
     --max_steps "${MAX_STEPS}" \
     --neuron_groups_dir "${NEURON_GROUPS_DIR}" \
-    --drift_log_dir "${DRIFT_LOG_DIR}" \
-    --drift_log_interval "${DRIFT_LOG_INTERVAL}" \
-    --initial_weights_dir "${INITIAL_WEIGHTS_DIR}"
+    --initial_weights_dir "${INITIAL_WEIGHTS_DIR}" \
+    --save_steps "${SAVE_STEPS}"
 
 echo ""
 echo "================================================"
 echo "Phase 2 Complete!"
 echo "================================================"
-echo "Fine-tuned model saved to: ${OUTPUT_DIR}"
-echo "Drift logs saved to: ${DRIFT_LOG_DIR}"
+echo "Fine-tuned model checkpoints saved to: ${OUTPUT_DIR}"
+echo "Initial weights saved to: ${INITIAL_WEIGHTS_DIR}"
 echo ""
-echo "Next step: Run analyze_drift.py to analyze results"
+echo "Next step: Run scripts/phase2b_compute_drift.sh to compute drift for all checkpoints"

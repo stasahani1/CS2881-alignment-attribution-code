@@ -226,57 +226,60 @@ def get_set_difference_neurons(
     return result
 
 
-def get_random_neurons(
+def get_random_neurons_per_layer(
     scores: Dict[str, torch.Tensor],
-    num_neurons: int,
+    k: float,
     seed: int = 0
 ) -> List[Tuple[str, int, int]]:
     """
-    Get random sample of neurons using memory-efficient sampling.
-    Does not materialize the full index space.
+    Get random sample of neurons per layer (matching SNIP/utility methodology).
+
+    This samples k% of neurons from EACH layer independently, ensuring
+    consistent methodology with safety and utility neuron identification.
 
     Args:
         scores: Dictionary mapping layer_name to score tensor (for dimensions)
-        num_neurons: Number of neurons to sample
+        k: Fraction of neurons to sample per layer (e.g., 0.01 for 1%)
         seed: Random seed
 
     Returns:
         List of (layer_name, row, col) tuples for random neurons
     """
     np.random.seed(seed)
-
-    # Calculate layer sizes without materializing indices
-    layer_info = []
+    result = []
     total_neurons = 0
 
-    for layer_name, score in sorted(scores.items()):
-        n = score.numel()
-        # Store: (layer_name, shape, offset, size)
-        layer_info.append((layer_name, score.shape, total_neurons, n))
-        total_neurons += n
+    print(f"Selecting random {k*100:.1f}% neurons per layer...")
 
-    print(f"Total neurons: {total_neurons:,}, sampling {num_neurons:,} random neurons")
+    for layer_name, score in tqdm(sorted(scores.items()), desc="Sampling random neurons"):
+        # Ensure tensor is on CPU for memory efficiency
+        if score.is_cuda:
+            score = score.cpu()
 
-    # Sample global indices
-    sampled_global_indices = np.random.choice(total_neurons, num_neurons, replace=False)
+        # Calculate how many neurons to sample from this layer
+        layer_size = score.numel()
+        layer_k = max(1, int(layer_size * k))
+        layer_k = min(layer_k, layer_size)
 
-    # Convert to (layer, row, col) without full materialization
-    sampled_neurons = []
+        if layer_k == 0:
+            continue
 
-    for global_idx in sorted(sampled_global_indices):
-        # Find which layer this index belongs to
-        for layer_name, shape, offset, size in layer_info:
-            if offset <= global_idx < offset + size:
-                # Convert global index to local index within this layer
-                local_idx = global_idx - offset
-                row = local_idx // shape[1]
-                col = local_idx % shape[1]
-                sampled_neurons.append((layer_name, int(row), int(col)))
-                break
+        # Sample random indices for this layer only
+        random_indices = np.random.choice(layer_size, layer_k, replace=False)
 
-    print(f"Sampled {len(sampled_neurons)} random neurons")
+        # Convert flat indices to row/col
+        rows = random_indices // score.shape[1]
+        cols = random_indices % score.shape[1]
 
-    return sampled_neurons
+        # Add to result
+        for row, col in zip(rows, cols):
+            result.append((layer_name, int(row), int(col)))
+
+        total_neurons += len(random_indices)
+
+    print(f"Selected {total_neurons:,} random neurons total ({k*100:.1f}% per layer)")
+
+    return result
 
 
 def save_neuron_groups(
@@ -413,12 +416,12 @@ def main():
     )
     print()
 
-    # 4. Random (same size as safety SNIP top-k)
+    # 4. Random (same percentage per layer as safety SNIP top-k)
     print("=" * 60)
     print("4. Identifying random neurons (baseline)...")
     print("=" * 60)
-    random_neurons = get_random_neurons(
-        safety_scores, len(safety_topk), args.seed
+    random_neurons = get_random_neurons_per_layer(
+        safety_scores, args.snip_top_k, args.seed
     )
     save_neuron_groups(
         random_neurons,

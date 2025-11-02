@@ -27,7 +27,7 @@ def load_neuron_groups(neuron_groups_dir: str) -> Dict[str, Dict]:
         "safety_snip_top": "neuron_groups_snip_top.json",
         "safety_set_diff": "neuron_groups_set_diff.json",
         "utility": "neuron_groups_utility.json",
-        # "random": "neuron_groups_random.json",
+        "random": "neuron_groups_random.json",
     }
 
     for group_name, filename in group_files.items():

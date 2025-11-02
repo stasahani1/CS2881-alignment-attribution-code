@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Create 3 plots for Figure 2b (rank-based methods):
-1. no_inst_ASR_multiple_nosys vs averaged zero-shot accuracy
-2. ASR_gcg vs averaged zero-shot accuracy
-3. inst_ASR_multiple_nosys vs averaged zero-shot accuracy
+1. ASR_vanilla (inst_ASR_basic) vs averaged zero-shot accuracy
+2. ASR_advsuffix (no_inst_ASR_gcg) vs averaged zero-shot accuracy
+3. ASR_advdecoding (no_inst_ASR_multiple_nosys) vs averaged zero-shot accuracy
 
 Compares:
 - ActSVD (top rank removal, rank=1)
@@ -27,17 +27,19 @@ def parse_log_file(log_path, rank_label):
             if len(parts) < 4:
                 continue
 
+            inst_prefix = parts[1]
             metric_name = parts[2]
             score_str = parts[3]
 
-            # Handle the inst_ prefix issue
-            if len(parts) >= 4 and parts[1] in ['inst_', 'no_inst_']:
-                metric_name = parts[2]
-                score_str = parts[3]
+            # Combine INST prefix with metric name when INST is 'inst_' or 'no_inst_'
+            if inst_prefix in ['inst_', 'no_inst_']:
+                full_metric_name = inst_prefix + metric_name
+            else:
+                full_metric_name = metric_name
 
             try:
                 score = float(score_str)
-                metrics[metric_name] = score
+                metrics[full_metric_name] = score
             except ValueError:
                 continue
 
@@ -62,6 +64,20 @@ def read_actsvd_data():
                 data[metric_name] = score
 
     return data
+
+def get_metric_value(data, metric_key):
+    """
+    Get metric value from data, handling special cases.
+    For actSVD data, 'no_inst_ASR_gcg' should also check for 'ASR_gcg'.
+    """
+    if metric_key in data:
+        return data[metric_key]
+
+    # Special case: actSVD has "ASR_gcg" but we're looking for "no_inst_ASR_gcg"
+    if metric_key == 'no_inst_ASR_gcg' and 'ASR_gcg' in data:
+        return data['ASR_gcg']
+
+    return None
 
 def read_orth_proj_data():
     """Read all orthogonal projection data"""
@@ -105,18 +121,18 @@ print("="*100)
 if actsvd_data:
     print("\nActSVD (rank=1 removal):")
     print(f"  Zero-shot: {actsvd_data.get('averaged', 'N/A'):.4f}")
-    print(f"  inst_ASR_multiple_nosys: {actsvd_data.get('inst_ASR_multiple_nosys', 'N/A'):.4f}")
-    print(f"  ASR_gcg: {actsvd_data.get('ASR_gcg', 'N/A'):.4f}")
-    print(f"  no_inst_ASR_multiple_nosys: {actsvd_data.get('no_inst_ASR_multiple_nosys', 'N/A'):.4f}")
+    print(f"  inst_ASR_basic (ASR_vanilla): {actsvd_data.get('inst_ASR_basic', 'N/A'):.4f}")
+    print(f"  ASR_gcg (ASR_advsuffix): {actsvd_data.get('ASR_gcg', 'N/A'):.4f}")
+    print(f"  no_inst_ASR_multiple_nosys (ASR_advdecoding): {actsvd_data.get('no_inst_ASR_multiple_nosys', 'N/A'):.4f}")
 
 print(f"\nOrthogonal Projection ({len(orth_proj_data)} experiments):")
-print(f"{'ru':<6} {'rs':<6} {'orth_dim':<10} {'Zero-shot':>12} {'inst_ASR':>12} {'ASR_gcg':>12} {'no_inst_ASR':>15}")
+print(f"{'ru':<6} {'rs':<6} {'orth_dim':<10} {'Zero-shot':>12} {'ASR_vanilla':>12} {'ASR_advsuffix':>14} {'ASR_advdecoding':>16}")
 print("-"*100)
 for data_point in orth_proj_data:
     print(f"{data_point['ru']:<6} {data_point['rs']:<6} {data_point['orth_dim']:<10} "
           f"{data_point.get('averaged', 0):.4f}      "
-          f"{data_point.get('inst_ASR_multiple_nosys', 0):.4f}      "
-          f"{data_point.get('ASR_gcg', 0):.4f}      "
+          f"{data_point.get('inst_ASR_basic', 0):.4f}      "
+          f"{data_point.get('no_inst_ASR_gcg', 0):.4f}         "
           f"{data_point.get('no_inst_ASR_multiple_nosys', 0):.4f}")
 print("="*100)
 
@@ -135,35 +151,37 @@ markers = {
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
 asr_metrics = [
-    ('no_inst_ASR_multiple_nosys', 'ASR (no_inst, multiple samples, no sys)'),
-    ('ASR_gcg', 'ASR (GCG Attack)'),
-    ('inst_ASR_multiple_nosys', 'ASR (inst, multiple samples, no sys)'),
+    ('inst_ASR_basic', 'ASR_vanilla'),
+    ('no_inst_ASR_gcg', 'ASR_advsuffix'),
+    ('no_inst_ASR_multiple_nosys', 'ASR_advdecoding'),
 ]
 
 for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     ax = axes[idx]
 
     # Plot ActSVD if available
-    if actsvd_data and metric_key in actsvd_data:
-        x = actsvd_data.get('averaged', 0)
-        y = actsvd_data.get(metric_key, 0)
+    if actsvd_data:
+        metric_value = get_metric_value(actsvd_data, metric_key)
+        if metric_value is not None:
+            x = actsvd_data.get('averaged', 0)
+            y = metric_value
 
-        ax.scatter(x, y,
-                  color=colors['ActSVD'],
-                  marker=markers['ActSVD'],
-                  s=250,
-                  label='ActSVD (rank=1)',
-                  edgecolors='black',
-                  linewidth=1.5,
-                  alpha=0.8,
-                  zorder=5)
+            ax.scatter(x, y,
+                      color=colors['ActSVD'],
+                      marker=markers['ActSVD'],
+                      s=250,
+                      label='ActSVD (rank=1)',
+                      edgecolors='black',
+                      linewidth=1.5,
+                      alpha=0.8,
+                      zorder=5)
 
-        ax.annotate('ActSVD',
-                   (x, y),
-                   xytext=(5, 5),
-                   textcoords='offset points',
-                   fontsize=9,
-                   alpha=0.7)
+            ax.annotate('ActSVD',
+                       (x, y),
+                       xytext=(5, 5),
+                       textcoords='offset points',
+                       fontsize=9,
+                       alpha=0.7)
 
     # Plot all orthogonal projection points
     x_vals = []
@@ -208,7 +226,8 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     # Set axis limits with some padding
     if x_vals or actsvd_data:
         all_x = x_vals + ([actsvd_data.get('averaged', 0)] if actsvd_data else [])
-        all_y = y_vals + ([actsvd_data.get(metric_key, 0)] if actsvd_data and metric_key in actsvd_data else [])
+        metric_value = get_metric_value(actsvd_data, metric_key) if actsvd_data else None
+        all_y = y_vals + ([metric_value] if metric_value is not None else [])
 
         if all_x and all_y:
             x_min, x_max = min(all_x), max(all_x)
@@ -236,26 +255,28 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     fig, ax = plt.subplots(figsize=(8, 6))
 
     # Plot ActSVD if available
-    if actsvd_data and metric_key in actsvd_data:
-        x = actsvd_data.get('averaged', 0)
-        y = actsvd_data.get(metric_key, 0)
+    if actsvd_data:
+        metric_value = get_metric_value(actsvd_data, metric_key)
+        if metric_value is not None:
+            x = actsvd_data.get('averaged', 0)
+            y = metric_value
 
-        ax.scatter(x, y,
-                  color=colors['ActSVD'],
-                  marker=markers['ActSVD'],
-                  s=300,
-                  label='ActSVD (rank=1)',
-                  edgecolors='black',
-                  linewidth=2,
-                  alpha=0.8,
-                  zorder=5)
+            ax.scatter(x, y,
+                      color=colors['ActSVD'],
+                      marker=markers['ActSVD'],
+                      s=300,
+                      label='ActSVD (rank=1)',
+                      edgecolors='black',
+                      linewidth=2,
+                      alpha=0.8,
+                      zorder=5)
 
-        ax.annotate('ActSVD',
-                   (x, y),
-                   xytext=(8, 8),
-                   textcoords='offset points',
-                   fontsize=11,
-                   alpha=0.7)
+            ax.annotate('ActSVD',
+                       (x, y),
+                       xytext=(8, 8),
+                       textcoords='offset points',
+                       fontsize=11,
+                       alpha=0.7)
 
     # Plot all orthogonal projection points
     x_vals = []
@@ -298,7 +319,8 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     # Set axis limits with some padding
     if x_vals or actsvd_data:
         all_x = x_vals + ([actsvd_data.get('averaged', 0)] if actsvd_data else [])
-        all_y = y_vals + ([actsvd_data.get(metric_key, 0)] if actsvd_data and metric_key in actsvd_data else [])
+        metric_value = get_metric_value(actsvd_data, metric_key) if actsvd_data else None
+        all_y = y_vals + ([metric_value] if metric_value is not None else [])
 
         if all_x and all_y:
             x_min, x_max = min(all_x), max(all_x)

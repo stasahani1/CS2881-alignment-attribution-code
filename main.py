@@ -443,7 +443,6 @@ def main():
             model=pruned_path,
             tokenizer=pruned_path,  # Load tokenizer from same path as model
             dtype="bfloat16",
-            swap_space=0,
         )
         if args.decouple_align_utility or args.decouple_align_misalign:
             vllm_model.llm_engine.tokenizer.add_special_tokens({"pad_token": "[PAD]"})

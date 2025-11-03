@@ -112,28 +112,35 @@ This:
 - Loads LLaMA-2-7B-Chat model
 - Applies LoRA (rank=8, alpha=16)
 - Fine-tunes on Alpaca dataset
-- Tracks weight drift every 100 steps
-- Computes cosine similarity, L2 distance, relative change for all neuron groups
+- Saves checkpoints every 500 steps
 
 **Output**:
-- Model: `/workspace/CS2881-alignment-attribution-code/finetuned_models/`
-- Drift logs: `/dev/shm/drift_logs/`
+- Model checkpoints: `/workspace/CS2881-alignment-attribution-code/finetuned_models/`
 
-#### Phase 3: Analyze Drift Patterns (~5-10 minutes)
+#### Phase 2b: Analyze Drift Patterns (~5-10 minutes)
 
 ```bash
-cd /workspace/CS2881-alignment-attribution-code
+bash scripts/phase2b_compute_drift.sh
+```
+
+This:
+- Loads all checkpoints
+- Computes drift
+
+**Output**:
+- Drift logs: `/dev/shm/drift_logs/`
+
+
+
+#### Phase 3: 
+```
 python analyze_drift.py \
     --drift_log_dir /dev/shm/drift_logs \
     --output_dir results
 ```
 
-This:
-- Loads all drift logs
 - Generates time series plots
 - Computes statistical comparisons (Cohen's d effect sizes)
-- Evaluates hypotheses
-- Creates summary report
 
 **Output**: `results/` directory with report and figures
 

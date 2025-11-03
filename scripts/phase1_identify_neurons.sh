@@ -14,7 +14,7 @@ SNIP_TOP_K=0.01          # Top 1% for SNIP method
 SET_DIFF_P=0.03           # Top-p% utility neurons to exclude
 SET_DIFF_Q=0.03           # Top-q% safety neurons to consider
 # Methods to run
-METHODS="top_safety set_difference"
+METHODS="top_safety top_utility set_difference"
 
 echo "================================================"
 echo "Phase 1b: Identifying Neuron Groups"

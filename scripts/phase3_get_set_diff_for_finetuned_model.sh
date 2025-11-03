@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 1: Compute SNIP scores for safety and utility datasets
+# Phase 3: Compute SNIP scores for safety and utility datasets
 
 set -e  # Exit on error
 

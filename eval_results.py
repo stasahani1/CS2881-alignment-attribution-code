@@ -1,6 +1,7 @@
 """
 Evaluation script to compare neuron groups between original and finetuned models.
-Calculates the percentage of neurons that are in both set_diffs and top_safety, layerwise and overall.
+Calculates the percentage of neurons that are in both set_diffs, top_safety, and top_utility, layerwise and overall.
+Also compares average SNIP scores between original and finetuned models.
 """
 
 import json
@@ -14,7 +15,7 @@ def load_neuron_group(filepath: str) -> Dict[str, list]:
     Load a neuron group JSON file.
     
     Format: {
-        "layer_name": [[row, col], ...],
+        "layer_name": [[row, col], ...] or [[row, col, score], ...],
         ...
     }
     
@@ -22,10 +23,29 @@ def load_neuron_group(filepath: str) -> Dict[str, list]:
         filepath: Path to the neuron group JSON file
         
     Returns:
-        Dictionary mapping layer names to lists of [row, col] neuron coordinates
+        Dictionary mapping layer names to lists of neuron coordinates (with optional scores)
     """
     with open(filepath, "r") as f:
         return json.load(f)
+
+
+def extract_scores_from_neurons(neuron_group: Dict[str, list]) -> List[float]:
+    """
+    Extract SNIP scores from neuron group data.
+    
+    Args:
+        neuron_group: Dictionary mapping layer names to lists of [row, col] or [row, col, score]
+        
+    Returns:
+        List of all scores found in the neuron group
+    """
+    scores = []
+    for layer_name, neurons in neuron_group.items():
+        for coord in neurons:
+            # If format is [row, col, score], extract the score
+            if len(coord) >= 3:
+                scores.append(float(coord[2]))
+    return scores
 
 
 def normalize_layer_name(layer_name: str) -> str:
@@ -101,6 +121,128 @@ def calculate_overlap_percentage(
     return percentage
 
 
+def compare_scores(
+    group_name: str,
+    original_path: str,
+    finetuned_path: str,
+    output_dir: str
+) -> Dict:
+    """
+    Compare average SNIP scores between original and finetuned neuron groups.
+    
+    Args:
+        group_name: Name of the neuron group (e.g., "top_safety", "top_utility")
+        original_path: Path to original neuron group file
+        finetuned_path: Path to finetuned neuron group file
+        output_dir: Directory to save output files
+        
+    Returns:
+        Dictionary with score comparison statistics
+    """
+    print("=" * 80)
+    print(f"Comparing SNIP Scores - {group_name.upper().replace('_', ' ')}")
+    print("=" * 80)
+    print()
+    
+    # Load neuron groups
+    original_neuron_group_raw = load_neuron_group(original_path)
+    finetuned_neuron_group_raw = load_neuron_group(finetuned_path)
+    
+    # Normalize layer names
+    original_neuron_group = {}
+    for layer_name, neurons in original_neuron_group_raw.items():
+        normalized = normalize_layer_name(layer_name)
+        if normalized in original_neuron_group:
+            original_neuron_group[normalized].extend(neurons)
+        else:
+            original_neuron_group[normalized] = neurons
+    
+    finetuned_neuron_group = {}
+    for layer_name, neurons in finetuned_neuron_group_raw.items():
+        normalized = normalize_layer_name(layer_name)
+        if normalized in finetuned_neuron_group:
+            finetuned_neuron_group[normalized].extend(neurons)
+        else:
+            finetuned_neuron_group[normalized] = neurons
+    
+    # Extract scores
+    original_scores = extract_scores_from_neurons(original_neuron_group)
+    finetuned_scores = extract_scores_from_neurons(finetuned_neuron_group)
+    
+    # Calculate statistics
+    if not original_scores or not finetuned_scores:
+        print(f"Warning: No scores found in neuron groups. Score format may be [row, col] instead of [row, col, score]")
+        return {
+            'group_name': group_name,
+            'original_avg_score': None,
+            'finetuned_avg_score': None,
+            'score_difference': None,
+            'score_ratio': None,
+            'original_count': len(original_scores) if original_scores else 0,
+            'finetuned_count': len(finetuned_scores) if finetuned_scores else 0
+        }
+    
+    original_avg = sum(original_scores) / len(original_scores)
+    finetuned_avg = sum(finetuned_scores) / len(finetuned_scores)
+    score_diff = finetuned_avg - original_avg
+    score_ratio = finetuned_avg / original_avg if original_avg != 0 else None
+    
+    # Layerwise score comparison
+    layerwise_score_results = []
+    all_layers = sorted(set(original_neuron_group.keys()) | set(finetuned_neuron_group.keys()))
+    
+    for layer in all_layers:
+        orig_layer_scores = []
+        for coord in original_neuron_group.get(layer, []):
+            if len(coord) >= 3:
+                orig_layer_scores.append(float(coord[2]))
+        
+        finetuned_layer_scores = []
+        for coord in finetuned_neuron_group.get(layer, []):
+            if len(coord) >= 3:
+                finetuned_layer_scores.append(float(coord[2]))
+        
+        if orig_layer_scores and finetuned_layer_scores:
+            orig_layer_avg = sum(orig_layer_scores) / len(orig_layer_scores)
+            finetuned_layer_avg = sum(finetuned_layer_scores) / len(finetuned_layer_scores)
+            layerwise_score_results.append({
+                'layer': layer,
+                'original_avg_score': round(orig_layer_avg, 6),
+                'finetuned_avg_score': round(finetuned_layer_avg, 6),
+                'score_difference': round(finetuned_layer_avg - orig_layer_avg, 6),
+                'score_ratio': round(finetuned_layer_avg / orig_layer_avg, 4) if orig_layer_avg != 0 else None,
+                'original_count': len(orig_layer_scores),
+                'finetuned_count': len(finetuned_layer_scores)
+            })
+    
+    # Print results
+    print(f"Original average SNIP score:  {original_avg:.6f} (from {len(original_scores):,} neurons)")
+    print(f"Finetuned average SNIP score: {finetuned_avg:.6f} (from {len(finetuned_scores):,} neurons)")
+    print(f"Score difference:             {score_diff:.6f} ({score_diff/original_avg*100:.2f}% change)" if original_avg != 0 else "Score difference: N/A")
+    print(f"Score ratio:                  {score_ratio:.4f}" if score_ratio is not None else "Score ratio: N/A")
+    print("=" * 80)
+    print()
+    
+    # Save layerwise score comparison
+    if layerwise_score_results:
+        layerwise_score_path = os.path.join(output_dir, f"layerwise_scores_{group_name}.json")
+        with open(layerwise_score_path, "w") as f:
+            json.dump(layerwise_score_results, f, indent=2)
+        print(f"Saved layerwise score comparison to: {layerwise_score_path}")
+        print()
+    
+    return {
+        'group_name': group_name,
+        'original_avg_score': round(original_avg, 6),
+        'finetuned_avg_score': round(finetuned_avg, 6),
+        'score_difference': round(score_diff, 6),
+        'score_change_percentage': round(score_diff / original_avg * 100, 2) if original_avg != 0 else None,
+        'score_ratio': round(score_ratio, 4) if score_ratio is not None else None,
+        'original_count': len(original_scores),
+        'finetuned_count': len(finetuned_scores)
+    }
+
+
 def analyze_neuron_group(
     group_name: str,
     original_path: str,
@@ -111,7 +253,7 @@ def analyze_neuron_group(
     Analyze overlap between original and finetuned neuron groups.
     
     Args:
-        group_name: Name of the neuron group (e.g., "set_diff", "top_safety")
+        group_name: Name of the neuron group (e.g., "set_diff", "top_safety", "top_utility")
         original_path: Path to original neuron group file
         finetuned_path: Path to finetuned neuron group file
         output_dir: Directory to save output files
@@ -206,6 +348,7 @@ def analyze_neuron_group(
     # Calculate additional statistics
     avg_layerwise_percentage = 0.0
     weighted_avg = 0.0
+    layerwise_percentages = []
     
     if layerwise_results:
         layerwise_percentages = [r['percentage'] for r in layerwise_results if r['original'] > 0]
@@ -271,6 +414,7 @@ def main():
     print()
     
     all_aggregated_results = {}
+    all_score_comparisons = {}
     
     # Analyze set_diff neurons
     original_set_diff_path = "outputs/neuron_groups/neuron_groups_set_diff.json"
@@ -284,10 +428,27 @@ def main():
     aggregated_top_safety = analyze_neuron_group("top_safety", original_top_safety_path, finetuned_top_safety_path, output_dir)
     all_aggregated_results['top_safety'] = aggregated_top_safety
     
+    # Analyze top_utility neurons
+    original_top_utility_path = "outputs/neuron_groups/neuron_groups_top_utility.json"
+    finetuned_top_utility_path = "outputs/neuron_groups_finetuned/neuron_groups_top_utility.json"
+    aggregated_top_utility = analyze_neuron_group("top_utility", original_top_utility_path, finetuned_top_utility_path, output_dir)
+    all_aggregated_results['top_utility'] = aggregated_top_utility
+    
+    # Compare SNIP scores for top_safety
+    score_comparison_top_safety = compare_scores("top_safety", original_top_safety_path, finetuned_top_safety_path, output_dir)
+    all_score_comparisons['top_safety'] = score_comparison_top_safety
+    
+    # Compare SNIP scores for top_utility
+    score_comparison_top_utility = compare_scores("top_utility", original_top_utility_path, finetuned_top_utility_path, output_dir)
+    all_score_comparisons['top_utility'] = score_comparison_top_utility
+    
     # Save aggregated results to file
     aggregated_output_path = os.path.join(output_dir, "aggregated_results.json")
     with open(aggregated_output_path, "w") as f:
-        json.dump(all_aggregated_results, f, indent=2)
+        json.dump({
+            'overlap_results': all_aggregated_results,
+            'score_comparisons': all_score_comparisons
+        }, f, indent=2)
     print(f"Saved aggregated results to: {aggregated_output_path}")
     
     print("=" * 80)

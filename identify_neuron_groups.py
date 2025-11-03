@@ -301,23 +301,39 @@ def save_neuron_scores(
         scores_dict: Dictionary mapping layer_name to score tensor
         output_path: Path to save scores JSON file
     """
-    # Group by layer
-    grouped = {}
+    # Group by layer first for batch processing
+    layer_neurons = {}
     for layer_name, row, col in neurons:
-        if layer_name not in grouped:
-            grouped[layer_name] = []
-        
-        # Get score for this neuron
-        if layer_name in scores_dict:
-            score_tensor = scores_dict[layer_name]
-            if score_tensor.is_cuda:
-                score_tensor = score_tensor.cpu()
-            # Convert to float and extract value
-            score_value = float(score_tensor[row, col].item())
-            grouped[layer_name].append([row, col, score_value])
-        else:
+        if layer_name not in layer_neurons:
+            layer_neurons[layer_name] = []
+        layer_neurons[layer_name].append((row, col))
+    
+    # Process each layer in batches (much faster than individual indexing)
+    grouped = {}
+    for layer_name, neuron_coords in tqdm(layer_neurons.items(), desc="Extracting scores"):
+        if layer_name not in scores_dict:
             # If layer not found, save with score 0 as fallback
-            grouped[layer_name].append([row, col, 0.0])
+            grouped[layer_name] = [[row, col, 0.0] for row, col in neuron_coords]
+            continue
+        
+        score_tensor = scores_dict[layer_name]
+        if score_tensor.is_cuda:
+            score_tensor = score_tensor.cpu()
+        
+        # Batch extract scores using advanced indexing (much faster)
+        rows = [row for row, col in neuron_coords]
+        cols = [col for row, col in neuron_coords]
+        
+        # Convert to tensors for batch indexing
+        rows_tensor = torch.tensor(rows, dtype=torch.long)
+        cols_tensor = torch.tensor(cols, dtype=torch.long)
+        
+        # Batch extract all scores at once - this is orders of magnitude faster
+        scores_batch = score_tensor[rows_tensor, cols_tensor].float().numpy()
+        
+        # Store results
+        grouped[layer_name] = [[row, col, float(score)] 
+                               for (row, col), score in zip(neuron_coords, scores_batch)]
     
     # Save to JSON
     with open(output_path, "w") as f:
@@ -443,6 +459,7 @@ def main():
         safety_topk = get_topk_neurons(safety_scores, args.snip_top_k)
         save_neuron_scores(
             safety_topk,
+            safety_scores,
             os.path.join(args.output_dir, "neuron_groups_top_safety.json")
         )
         results["top_safety"] = len(safety_topk)
@@ -458,6 +475,7 @@ def main():
         )
         save_neuron_scores(
             set_diff_neurons,
+            safety_scores,
             os.path.join(args.output_dir, "neuron_groups_set_diff.json")
         )
         results["set_difference"] = len(set_diff_neurons)
@@ -471,6 +489,7 @@ def main():
         utility_topk = get_topk_neurons(utility_scores, args.snip_top_k)
         save_neuron_scores(
             utility_topk,
+            utility_scores,
             os.path.join(args.output_dir, "neuron_groups_top_utility.json")
         )
         results["top_utility"] = len(utility_topk)
@@ -486,6 +505,7 @@ def main():
         )
         save_neuron_scores(
             random_neurons,
+            safety_scores,
             os.path.join(args.output_dir, "neuron_groups_random.json")
         )
         results["random"] = len(random_neurons)

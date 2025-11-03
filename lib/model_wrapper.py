@@ -10,7 +10,7 @@ from .data import get_loaders
 from functools import reduce
 import pickle
 import re
-from .prune import return_given_alpha
+from .prune import return_given_alpha, load_wanda_score
 
 
 class ActLinear(nn.Module):
@@ -184,7 +184,7 @@ def prune_wanda_v2(
             else:
                 model(inp)
 
-    _prune_core(args, model, model_base, prune_n, prune_m, prune_mode="activation")
+    _prune_core(args, model, model_base, prune_n, prune_m, prune_mode="activation", prune_data=prune_data)
     model = revert_Act_to_Linear(model)
 
 
@@ -233,7 +233,7 @@ def prune_wandg_v1(
             loss = model(input_ids=inp, labels=tar)[0]
         loss.backward()
 
-    _prune_core(args, model, model_base, prune_n, prune_m, prune_mode="gradient")
+    _prune_core(args, model, model_base, prune_n, prune_m, prune_mode="gradient", prune_data=prune_data)
     model = revert_Act_to_Linear(model)
     model.zero_grad()  # freeze gradient to save cuda memory
 
@@ -250,69 +250,88 @@ def prune_wandg(
 ):
     model = make_Act(model, verbose=False)
 
-    print(f"loading calibdation data {prune_data}")
-    assert prune_data in [
-        "wikitext",
-        "alpaca",
-        "alpaca_cleaned",
-        "alpaca_cleaned_no_safety",
-        "align",
-        "align_short",
-        "misalign",
-    ]
-    dataloader, _ = get_loaders(
-        prune_data,
-        nsamples=args.nsamples,
-        seed=args.seed,
-        seqlen=model.seqlen,
-        tokenizer=tokenizer,
-        disentangle=args.disentangle,
-    )
-    print("dataset loading complete")
+    # Only compute gradients if not loading pre-computed scores
+    if not args.load_wanda_score:
+        print(f"loading calibdation data {prune_data}")
+        assert prune_data in [
+            "wikitext",
+            "alpaca",
+            "alpaca_cleaned",
+            "alpaca_cleaned_no_safety",
+            "align",
+            "align_short",
+            "misalign",
+        ]
+        dataloader, _ = get_loaders(
+            prune_data,
+            nsamples=args.nsamples,
+            seed=args.seed,
+            seqlen=model.seqlen,
+            tokenizer=tokenizer,
+            disentangle=args.disentangle,
+        )
+        print("dataset loading complete")
 
-    num_hidden_layers = model.config.num_hidden_layers
-    saved_grad = {}
-    for layer in range(num_hidden_layers):
-        layer_filter_fn = (
-            lambda x: f"layers.{layer}." in x
-        )  ### TODO # hack for llama series
+        num_hidden_layers = model.config.num_hidden_layers
+        saved_grad = {}
+        for layer in range(num_hidden_layers):
+            layer_filter_fn = (
+                lambda x: f"layers.{layer}." in x
+            )  ### TODO # hack for llama series
 
-        model.zero_grad()
-        model.requires_grad_(False)
-        for name, module in model.named_modules():
-            if layer_filter_fn(name) and isinstance(module, ActLinear):
-                print("enabling grad for ", name)
-                module.base.requires_grad_(True)
-                saved_grad[name] = torch.zeros_like(
-                    module.base.weight, device=module.base.weight.device
-                )
-                module.base.zero_grad()
-
-        for batch in dataloader:
-            inp, tar = batch[0].to(device), batch[1].to(device)
-            assert args.disentangle, "should run in disentangle mode"
             model.zero_grad()
-            with no_act_recording(model):
-                loss = model(input_ids=inp, labels=tar)[0]
-            loss.backward()
+            model.requires_grad_(False)
             for name, module in model.named_modules():
                 if layer_filter_fn(name) and isinstance(module, ActLinear):
-                    saved_grad[name] += module.base.weight.grad.abs()
+                    print("enabling grad for ", name)
+                    module.base.requires_grad_(True)
+                    saved_grad[name] = torch.zeros_like(
+                        module.base.weight, device=module.base.weight.device
+                    )
+                    module.base.zero_grad()
 
-        for name, module in model.named_modules():
-            if layer_filter_fn(name) and isinstance(module, ActLinear):
-                module.base.weight.grad.copy_(saved_grad[name])
-                saved_grad.pop(name)
-        _prune_core(
-            args,
-            model,
-            model_base,
-            prune_n,
-            prune_m,
-            prune_mode="gradient",
-            name_filter_fn=layer_filter_fn,
-        )
-        # print(torch.cuda.memory_allocated() /1024/1024/1024)
+            for batch in dataloader:
+                inp, tar = batch[0].to(device), batch[1].to(device)
+                assert args.disentangle, "should run in disentangle mode"
+                model.zero_grad()
+                with no_act_recording(model):
+                    loss = model(input_ids=inp, labels=tar)[0]
+                loss.backward()
+                for name, module in model.named_modules():
+                    if layer_filter_fn(name) and isinstance(module, ActLinear):
+                        saved_grad[name] += module.base.weight.grad.abs()
+
+            for name, module in model.named_modules():
+                if layer_filter_fn(name) and isinstance(module, ActLinear):
+                    module.base.weight.grad.copy_(saved_grad[name])
+                    saved_grad.pop(name)
+            _prune_core(
+                args,
+                model,
+                model_base,
+                prune_n,
+                prune_m,
+                prune_mode="gradient",
+                name_filter_fn=layer_filter_fn,
+                prune_data=prune_data,
+            )
+            # print(torch.cuda.memory_allocated() /1024/1024/1024)
+    else:
+        print(f"Loading pre-computed wanda scores for {prune_data}")
+        # When loading scores, just do pruning without computing gradients
+        num_hidden_layers = model.config.num_hidden_layers
+        for layer in range(num_hidden_layers):
+            layer_filter_fn = lambda x: f"layers.{layer}." in x
+            _prune_core(
+                args,
+                model,
+                model_base,
+                prune_n,
+                prune_m,
+                prune_mode="gradient",
+                name_filter_fn=layer_filter_fn,
+                prune_data=prune_data,
+            )
 
     model = revert_Act_to_Linear(model)
     model.zero_grad()  # freeze gradient to save cuda memory
@@ -326,13 +345,15 @@ def _prune_core(
     prune_m=0,
     prune_mode="activation",
     name_filter_fn=None,
+    prune_data=None,
 ):
     """
     data aware
     """
     assert not args.prune_part, "Warning: prune_part is not supported"
     # assert not args.neg_prune, "Warning: neg_prune is not supported"
-    prune_data = args.prune_data
+    if prune_data is None:
+        prune_data = args.prune_data
     for name, module in model.named_modules():
         if name_filter_fn is not None and not name_filter_fn(name):
             continue
@@ -351,21 +372,39 @@ def _prune_core(
             if model_base is not None:
                 module_base = model_base.get_submodule(name)
 
-            if args.use_diff:
-                magnitude = torch.abs(module.base.weight.data - module_base.weight.data)
+            # Either load pre-computed scores or compute them
+            if args.load_wanda_score:
+                # Load pre-computed wanda scores
+                W_metric = load_wanda_score(
+                    args,
+                    args.model,
+                    i,
+                    name,
+                    prune_data,
+                    use_diff=args.use_diff,
+                    disentangle=args.disentangle
+                )
+                # Move to the correct device
+                W_metric = W_metric.to(module.base.weight.device)
+                if args.neg_prune:
+                    W_metric = -W_metric
             else:
-                magnitude = torch.abs(module.base.weight.data)
+                # Compute W_metric
+                if args.use_diff:
+                    magnitude = torch.abs(module.base.weight.data - module_base.weight.data)
+                else:
+                    magnitude = torch.abs(module.base.weight.data)
 
-            if prune_mode == "activation":
-                act = (module.activation_norms**0.5).unsqueeze(0)
-            elif prune_mode == "gradient":
-                act = module.base.weight.grad.abs()
-            else:
-                raise NotImplemented
+                if prune_mode == "activation":
+                    act = (module.activation_norms**0.5).unsqueeze(0)
+                elif prune_mode == "gradient":
+                    act = module.base.weight.grad.abs()
+                else:
+                    raise NotImplemented
 
-            W_metric = magnitude * act
-            if args.neg_prune:
-                W_metric = -W_metric
+                W_metric = magnitude * act
+                if args.neg_prune:
+                    W_metric = -W_metric
 
             # copied from lib/prune.py prune_wanda:
 

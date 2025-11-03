@@ -261,7 +261,9 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     ax.set_title(f'Figure 2b: {metric_label}\nvs Zero-shot Accuracy',
                 fontsize=13, fontweight='bold', pad=10)
     ax.grid(True, alpha=0.3, linestyle='--')
-    ax.legend(loc='best', fontsize=10, framealpha=0.9)
+    # Move legend down for advsuffix plot to avoid overlap
+    legend_loc = 'lower right' if metric_label == 'ASR_advsuffix' else 'best'
+    ax.legend(loc=legend_loc, fontsize=10, framealpha=0.9)
 
     # Set axis limits with some padding
     if x_vals or actsvd_data or original_data:
@@ -365,7 +367,9 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
     ax.set_title(f'Figure 2b: {metric_label}\nvs Zero-shot Accuracy',
                 fontsize=15, fontweight='bold', pad=15)
     ax.grid(True, alpha=0.3, linestyle='--')
-    ax.legend(loc='best', fontsize=12, framealpha=0.9)
+    # Move legend down for advsuffix plot to avoid overlap
+    legend_loc = 'lower right' if metric_label == 'ASR_advsuffix' else 'best'
+    ax.legend(loc=legend_loc, fontsize=12, framealpha=0.9)
 
     # Set axis limits with some padding
     if x_vals or actsvd_data or original_data:

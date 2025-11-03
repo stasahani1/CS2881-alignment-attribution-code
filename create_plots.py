@@ -68,6 +68,10 @@ def read_setdiff_data():
     sparsity_dirs = sorted(glob.glob('results/fig2a/snip_setdiff/sparsity_*'))
 
     for sparsity_dir in sparsity_dirs:
+        # Skip sparsity_0.0000
+        if 'sparsity_0.0000' in sparsity_dir:
+            continue
+
         log_file = os.path.join(sparsity_dir, 'log_wandg_set_difference.txt')
         if not os.path.exists(log_file):
             continue

@@ -148,6 +148,75 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     return W_mask, cur_sparsity
 
 
+def load_wanda_score(args, model_name, layer_idx, layer_name, prune_data, use_diff=False, disentangle=False):
+    """
+    Load pre-computed wanda scores from pickle files.
+
+    Args:
+        args: Arguments object
+        model_name: Model name (e.g., 'llama2-7b-chat-hf')
+        layer_idx: Layer index
+        layer_name: Layer name (e.g., 'self_attn.q_proj' or 'model.layers.0.self_attn.q_proj')
+        prune_data: Dataset name used for computing scores
+        use_diff: Whether the scores were computed with weight diff
+        disentangle: Whether the scores were computed with disentangle mode
+
+    Returns:
+        W_metric: Loaded wanda scores tensor
+    """
+    # Determine the folder path based on the configuration
+    if use_diff:
+        if disentangle:
+            score_folder = f"wanda_score/{prune_data}_weight_diff_disentangle"
+        else:
+            score_folder = f"wanda_score/{prune_data}_weight_diff"
+    else:
+        if disentangle:
+            score_folder = f"wanda_score/{prune_data}_weight_only_disentangle"
+        else:
+            score_folder = f"wanda_score/{prune_data}_weight_only"
+
+    # Try multiple filename formats (wanda vs wandg save different formats)
+    paths_to_try = []
+
+    # Format 1: Wanda format with local name (e.g., "self_attn.q_proj")
+    paths_to_try.append(os.path.join(
+        args.save,
+        score_folder,
+        f"W_metric_layer_{layer_idx}_name_{layer_name}_{prune_data}_{'weight_diff' if use_diff else 'weight_only'}{'_disentangle' if disentangle else ''}.pkl"
+    ))
+
+    # Format 2: Wandg format with full name (e.g., "model.layers.0.self_attn.q_proj")
+    full_layer_name = f"model.layers.{layer_idx}.{layer_name}"
+    paths_to_try.append(os.path.join(
+        args.save,
+        "wanda_score",
+        f"W_metric_layer_{layer_idx}_name_{full_layer_name}_{'weight_diff' if use_diff else 'weight'}.pkl"
+    ))
+
+    # Format 3: Alternative wandg format without subfolders
+    paths_to_try.append(os.path.join(
+        args.save,
+        "wanda_score",
+        f"W_metric_layer_{layer_idx}_name_{layer_name}_{'weight_diff' if use_diff else 'weight'}.pkl"
+    ))
+
+    # Try all paths
+    for score_path in paths_to_try:
+        if os.path.exists(score_path):
+            print(f"Loading pre-computed score from: {score_path}")
+            with open(score_path, "rb") as f:
+                W_metric = pickle.load(f)
+            return W_metric
+
+    # If none found, raise error with all attempted paths
+    raise FileNotFoundError(
+        f"Pre-computed wanda score not found. Tried:\n" +
+        "\n".join(f"  - {p}" for p in paths_to_try) +
+        f"\nPlease run with --dump_wanda_score first to generate scores."
+    )
+
+
 def prune_random(
     args,
     model,
@@ -264,38 +333,44 @@ def prune_wanda(
 ):
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    print(f"loading calibration data {prune_data}")
-    assert prune_data in [
-        "wikitext",
-        "alpaca",
-        "alpaca_cleaned",
-        "alpaca_cleaned_no_safety",
-        "align",
-        "align_short",
-        "misalign",
-    ]
-    dataloader, _ = get_loaders(
-        prune_data,
-        nsamples=args.nsamples,
-        seed=args.seed,
-        seqlen=model.seqlen,
-        tokenizer=tokenizer,
-        disentangle=args.disentangle,
-    )
-    # dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, tars, attention_mask, position_ids = prepare_calibration_input(
-            model, dataloader, device, args.nsamples
+
+    # Only load calibration data if we're computing scores (not loading them)
+    if not args.load_wanda_score:
+        print(f"loading calibration data {prune_data}")
+        assert prune_data in [
+            "wikitext",
+            "alpaca",
+            "alpaca_cleaned",
+            "alpaca_cleaned_no_safety",
+            "align",
+            "align_short",
+            "misalign",
+        ]
+        dataloader, _ = get_loaders(
+            prune_data,
+            nsamples=args.nsamples,
+            seed=args.seed,
+            seqlen=model.seqlen,
+            tokenizer=tokenizer,
+            disentangle=args.disentangle,
         )
+        # dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+        print("dataset loading complete")
+        with torch.no_grad():
+            inps, outs, tars, attention_mask, position_ids = prepare_calibration_input(
+                model, dataloader, device, args.nsamples
+            )
 
-    if not args.disentangle:
-        tars = [torch.zeros_like(tar) for tar in tars]  # remove -100's
+        if not args.disentangle:
+            tars = [torch.zeros_like(tar) for tar in tars]  # remove -100's
 
-    inps = [inp.squeeze(0).to(device) for inp in inps]
-    tars = [tar.squeeze(0).to(device) for tar in tars]
-    attention_mask = [am.to(device) for am in attention_mask]
-    position_ids = [pids.to(device) for pids in position_ids]
+        inps = [inp.squeeze(0).to(device) for inp in inps]
+        tars = [tar.squeeze(0).to(device) for tar in tars]
+        attention_mask = [am.to(device) for am in attention_mask]
+        position_ids = [pids.to(device) for pids in position_ids]
+    else:
+        print(f"Loading pre-computed wanda scores for {prune_data}")
+        inps, outs, tars, attention_mask, position_ids = None, None, None, None, None
 
     layers = model.model.layers
     if args.use_diff or args.recover_from_base:
@@ -313,58 +388,80 @@ def prune_wanda(
         if args.use_diff or args.recover_from_base:
             subset_base = find_layers(layers_base[i])
 
-        if (
-            f"model.layers.{i}" in model.hf_device_map
-        ):  ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs, tars, attention_mask, position_ids = (
-                inps.to(dev),
-                outs.to(dev),
-                tars.to(dev),
-                attention_mask.to(dev),
-                position_ids.to(dev),
-            )  # TODO
+        # Only compute activations if not loading pre-computed scores
+        if not args.load_wanda_score:
+            if (
+                f"model.layers.{i}" in model.hf_device_map
+            ):  ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+                dev = model.hf_device_map[f"model.layers.{i}"]
+                inps, outs, tars, attention_mask, position_ids = (
+                    inps.to(dev),
+                    outs.to(dev),
+                    tars.to(dev),
+                    attention_mask.to(dev),
+                    position_ids.to(dev),
+                )  # TODO
 
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
+            wrapped_layers = {}
+            for name in subset:
+                wrapped_layers[name] = WrappedGPT(subset[name])
 
-        def add_batch(name, tar):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data, tar)
+            def add_batch(name, tar):
+                def tmp(_, inp, out):
+                    wrapped_layers[name].add_batch(inp[0].data, out.data, tar)
 
-            return tmp
+                return tmp
 
-        for j in range(args.nsamples):
-            handles = []
-            for name in wrapped_layers:
-                handles.append(
-                    subset[name].register_forward_hook(add_batch(name, tars[j]))
-                )
+            for j in range(args.nsamples):
+                handles = []
+                for name in wrapped_layers:
+                    handles.append(
+                        subset[name].register_forward_hook(add_batch(name, tars[j]))
+                    )
 
-            with torch.no_grad():
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask[j],
-                    position_ids=position_ids[j],
-                )[0]
+                with torch.no_grad():
+                    outs[j] = layer(
+                        inps[j].unsqueeze(0),
+                        attention_mask=attention_mask[j],
+                        position_ids=position_ids[j],
+                    )[0]
 
-            for h in handles:
-                h.remove()
+                for h in handles:
+                    h.remove()
 
         if not args.prune_part:
             for name in subset:
                 print(f"pruning layer {i} name {name}")
-                if args.use_diff or args.recover_from_base:
-                    magnitude = torch.abs(
-                        subset[name].weight.data - subset_base[name].weight.data
+
+                # Either load pre-computed scores or compute them
+                if args.load_wanda_score:
+                    # Load pre-computed wanda scores
+                    # Use just the layer name (not full path) to match dump format
+                    W_metric = load_wanda_score(
+                        args,
+                        args.model,
+                        i,
+                        name,  # Use local name like "self_attn.q_proj", not full path
+                        prune_data,
+                        use_diff=args.use_diff,
+                        disentangle=args.disentangle
                     )
+                    # Move to the correct device
+                    W_metric = W_metric.to(subset[name].weight.device)
+                    if args.neg_prune:
+                        W_metric = -W_metric
                 else:
-                    magnitude = torch.abs(subset[name].weight.data)
-                act = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
-                W_metric = magnitude * act
-                if args.neg_prune:
-                    W_metric = -W_metric
+                    # Compute W_metric from activations
+                    if args.use_diff or args.recover_from_base:
+                        magnitude = torch.abs(
+                            subset[name].weight.data - subset_base[name].weight.data
+                        )
+                    else:
+                        magnitude = torch.abs(subset[name].weight.data)
+                    act = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+                    W_metric = magnitude * act
+                    if args.neg_prune:
+                        W_metric = -W_metric
 
                 if args.dump_wanda_score:
                     # Only save the score, no pruning
@@ -500,16 +597,36 @@ def prune_wanda(
                 )
                 if condition:
                     print(f"pruning layer {i} name {name}")
-                    if args.use_diff or args.recover_from_base:
-                        magnitude = torch.abs(
-                            subset[name].weight.data - subset_base[name].weight.data
+
+                    # Either load pre-computed scores or compute them
+                    if args.load_wanda_score:
+                        # Load pre-computed wanda scores
+                        # Use just the layer name (not full path) to match dump format
+                        W_metric = load_wanda_score(
+                            args,
+                            args.model,
+                            i,
+                            name,  # Use local name like "self_attn.q_proj", not full path
+                            prune_data,
+                            use_diff=args.use_diff,
+                            disentangle=args.disentangle
                         )
+                        # Move to the correct device
+                        W_metric = W_metric.to(subset[name].weight.device)
+                        if args.neg_prune:
+                            W_metric = -W_metric
                     else:
-                        magnitude = torch.abs(subset[name].weight.data)
-                    act = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
-                    W_metric = magnitude * act
-                    if args.neg_prune:
-                        W_metric = -W_metric
+                        # Compute W_metric from activations
+                        if args.use_diff or args.recover_from_base:
+                            magnitude = torch.abs(
+                                subset[name].weight.data - subset_base[name].weight.data
+                            )
+                        else:
+                            magnitude = torch.abs(subset[name].weight.data)
+                        act = torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+                        W_metric = magnitude * act
+                        if args.neg_prune:
+                            W_metric = -W_metric
 
                     if args.dump_wanda_score:
                         # Only save the score, no pruning
@@ -625,14 +742,16 @@ def prune_wanda(
                     else:
                         subset[name].weight.data[W_mask] = 0  ## set weights to zero
 
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask[j],
-                    position_ids=position_ids[j],
-                )[0].squeeze(0)
-        inps, outs = outs, inps
+        # Only update activations if we computed them (not loading scores)
+        if not args.load_wanda_score:
+            for j in range(args.nsamples):
+                with torch.no_grad():
+                    outs[j] = layer(
+                        inps[j].unsqueeze(0),
+                        attention_mask=attention_mask[j],
+                        position_ids=position_ids[j],
+                    )[0].squeeze(0)
+            inps, outs = outs, inps
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()

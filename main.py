@@ -156,6 +156,9 @@ def main():
     parser.add_argument(
         "--dump_wanda_score", action="store_true", help="Whether to dump wanda scores."
     )
+    parser.add_argument(
+        "--load_wanda_score", action="store_true", help="Whether to load pre-computed wanda scores instead of computing them."
+    )
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     parser.add_argument("--eval_attack", action="store_true")
@@ -189,6 +192,9 @@ def main():
     args = parser.parse_args()
 
     print("Disentangle:", args.disentangle)
+
+    if args.dump_wanda_score and args.load_wanda_score:
+        raise ValueError("Cannot use both --dump_wanda_score and --load_wanda_score at the same time")
 
     if args.dump_wanda_score:
         assert args.prune_method in [

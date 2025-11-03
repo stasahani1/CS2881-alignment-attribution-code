@@ -5,15 +5,16 @@
 set -e  # Exit on error
 
 # Configuration
-SCORE_BASE_DIR="/dev/shm/snip_scores"
-OUTPUT_DIR="/workspace/CS2881-alignment-attribution-code/neuron_groups"
-
+SCORE_BASE_DIR="outputs/snip_scores"
+OUTPUT_DIR="outputs/neuron_groups"
+SAFETY_DATASET="align_short"
+UTILITY_DATASET="alpaca_cleaned_no_safety"
 # Neuron identification parameters
-# Optimized values: reduced from 1% to 0.1% for 10x speedup
-# Still statistically valid (~6.5M neurons) and focuses on most critical neurons
-SNIP_TOP_K=0.001          # Top 0.1% for SNIP method (was 0.01)
-SET_DIFF_P=0.05           # Top 5% utility neurons to exclude (was 0.05)
-SET_DIFF_Q=0.002          # Top 0.2% safety neurons to consider (was 0.02)
+SNIP_TOP_K=0.01          # Top 1% for SNIP method
+SET_DIFF_P=0.03           # Top-p% utility neurons to exclude
+SET_DIFF_Q=0.03           # Top-q% safety neurons to consider
+# Methods to run
+METHODS="top_safety top_utility set_difference"
 
 echo "================================================"
 echo "Phase 1b: Identifying Neuron Groups"
@@ -29,10 +30,13 @@ mkdir -p "${OUTPUT_DIR}"
 echo "Identifying neuron groups..."
 python identify_neuron_groups.py \
     --score_base_dir "${SCORE_BASE_DIR}" \
+    --safety_dataset "${SAFETY_DATASET}" \
+    --utility_dataset "${UTILITY_DATASET}" \
     --output_dir "${OUTPUT_DIR}" \
     --snip_top_k "${SNIP_TOP_K}" \
     --set_diff_p "${SET_DIFF_P}" \
     --set_diff_q "${SET_DIFF_Q}" \
+    --methods ${METHODS} \
     --seed 0
 
 echo ""

@@ -121,6 +121,33 @@ def calculate_overlap_percentage(
     return percentage
 
 
+def calculate_jaccard_index(
+    original_neurons: Set[Tuple[int, int]],
+    finetuned_neurons: Set[Tuple[int, int]]
+) -> float:
+    """
+    Calculate Jaccard's index (Jaccard similarity coefficient) between two sets.
+    
+    Jaccard's index = |A ∩ B| / |A ∪ B|
+    where A ∩ B is the intersection and A ∪ B is the union.
+    
+    Args:
+        original_neurons: Set of neurons from original model
+        finetuned_neurons: Set of neurons from finetuned model
+        
+    Returns:
+        Jaccard's index (0-1), where 1 means identical sets and 0 means no overlap
+    """
+    intersection = original_neurons & finetuned_neurons
+    union = original_neurons | finetuned_neurons
+    
+    if len(union) == 0:
+        return 0.0
+    
+    jaccard = len(intersection) / len(union)
+    return jaccard
+
+
 def compare_scores(
     group_name: str,
     original_path: str,
@@ -303,11 +330,12 @@ def analyze_neuron_group(
     total_original = 0
     total_finetuned = 0
     total_overlap = 0
+    total_union = 0
     
     print("=" * 80)
     print(f"Layerwise Overlap Results - {group_name.upper().replace('_', ' ')}")
     print("=" * 80)
-    print(f"{'Layer':<50} {'Original':<12} {'Finetuned':<12} {'Overlap':<12} {'Percentage':<12}")
+    print(f"{'Layer':<50} {'Original':<12} {'Finetuned':<12} {'Overlap':<12} {'Percentage':<12} {'Jaccard':<12}")
     print("-" * 80)
     
     for layer in all_layers:
@@ -315,8 +343,11 @@ def analyze_neuron_group(
         finetuned_neurons = neuron_list_to_set(finetuned_neuron_group.get(layer, []))
         
         overlap = original_neurons & finetuned_neurons
+        union = original_neurons | finetuned_neurons
         overlap_count = len(overlap)
+        union_count = len(union)
         overlap_pct = calculate_overlap_percentage(original_neurons, finetuned_neurons)
+        jaccard = calculate_jaccard_index(original_neurons, finetuned_neurons)
         
         original_count = len(original_neurons)
         finetuned_count = len(finetuned_neurons)
@@ -325,39 +356,48 @@ def analyze_neuron_group(
         total_original += original_count
         total_finetuned += finetuned_count
         total_overlap += overlap_count
+        total_union += union_count
         
         layerwise_results.append({
             'layer': layer,
             'original': original_count,
             'finetuned': finetuned_count,
             'overlap': overlap_count,
-            'percentage': round(overlap_pct, 2)
+            'union': union_count,
+            'percentage': round(overlap_pct, 2),
+            'jaccard_index': round(jaccard, 4)
         })
         
         # Print layer result
-        print(f"{layer:<50} {original_count:<12,} {finetuned_count:<12,} {overlap_count:<12,} {overlap_pct:>10.2f}%")
+        print(f"{layer:<50} {original_count:<12,} {finetuned_count:<12,} {overlap_count:<12,} {overlap_pct:>10.2f}% {jaccard:>10.4f}")
     
-    # Calculate overall percentage
+    # Calculate overall percentage and Jaccard's index
     overall_percentage = (total_overlap / total_original * 100.0) if total_original > 0 else 0.0
+    overall_jaccard = (total_overlap / total_union) if total_union > 0 else 0.0
     
     print("-" * 80)
-    print(f"{'TOTAL':<50} {total_original:<12,} {total_finetuned:<12,} {total_overlap:<12,} {overall_percentage:>10.2f}%")
+    print(f"{'TOTAL':<50} {total_original:<12,} {total_finetuned:<12,} {total_overlap:<12,} {overall_percentage:>10.2f}% {overall_jaccard:>10.4f}")
     print("=" * 80)
     print()
     
     # Calculate additional statistics
     avg_layerwise_percentage = 0.0
     weighted_avg = 0.0
+    avg_layerwise_jaccard = 0.0
     layerwise_percentages = []
+    layerwise_jaccards = []
     
     if layerwise_results:
         layerwise_percentages = [r['percentage'] for r in layerwise_results if r['original'] > 0]
+        layerwise_jaccards = [r['jaccard_index'] for r in layerwise_results if r['union'] > 0]
         if layerwise_percentages:
             avg_layerwise_percentage = sum(layerwise_percentages) / len(layerwise_percentages)
             weighted_avg = sum(
                 r['percentage'] * r['original'] 
                 for r in layerwise_results if r['original'] > 0
             ) / total_original if total_original > 0 else 0.0
+        if layerwise_jaccards:
+            avg_layerwise_jaccard = sum(layerwise_jaccards) / len(layerwise_jaccards)
     
     # Summary
     print("=" * 80)
@@ -367,7 +407,9 @@ def analyze_neuron_group(
     print(f"Total original neurons:       {total_original:,}")
     print(f"Total finetuned neurons:      {total_finetuned:,}")
     print(f"Total neurons in both:        {total_overlap:,}")
+    print(f"Total neurons in union:       {total_union:,}")
     print(f"Overall overlap percentage:   {overall_percentage:.2f}%")
+    print(f"Overall Jaccard's index:      {overall_jaccard:.4f}")
     print("=" * 80)
     
     # Additional statistics
@@ -377,6 +419,8 @@ def analyze_neuron_group(
         print("-" * 80)
         print(f"Average layerwise percentage (unweighted): {avg_layerwise_percentage:.2f}%")
         print(f"Average layerwise percentage (weighted):   {weighted_avg:.2f}%")
+        if layerwise_jaccards:
+            print(f"Average layerwise Jaccard's index:       {avg_layerwise_jaccard:.4f}")
         print("=" * 80)
     
     # Save layerwise results to file
@@ -392,9 +436,12 @@ def analyze_neuron_group(
         'total_original_neurons': total_original,
         'total_finetuned_neurons': total_finetuned,
         'total_overlap_neurons': total_overlap,
+        'total_union_neurons': total_union,
         'overall_overlap_percentage': round(overall_percentage, 2),
+        'overall_jaccard_index': round(overall_jaccard, 4),
         'average_layerwise_percentage_unweighted': round(avg_layerwise_percentage, 2),
-        'average_layerwise_percentage_weighted': round(weighted_avg, 2)
+        'average_layerwise_percentage_weighted': round(weighted_avg, 2),
+        'average_layerwise_jaccard_index': round(avg_layerwise_jaccard, 4) if layerwise_jaccards else None
     }
     
     print()
@@ -441,6 +488,10 @@ def main():
     # Compare SNIP scores for top_utility
     score_comparison_top_utility = compare_scores("top_utility", original_top_utility_path, finetuned_top_utility_path, output_dir)
     all_score_comparisons['top_utility'] = score_comparison_top_utility
+
+    # Compare SNIP scores for set_diff (safety-critical neurons)
+    score_comparison_set_diff = compare_scores("set_diff", original_set_diff_path, finetuned_set_diff_path, output_dir)
+    all_score_comparisons['set_diff'] = score_comparison_set_diff
     
     # Save aggregated results to file
     aggregated_output_path = os.path.join(output_dir, "aggregated_results.json")

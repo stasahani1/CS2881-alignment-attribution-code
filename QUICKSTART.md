@@ -1,4 +1,4 @@
-# Quick Start Guide - Neuron Drift Experiment
+# Quick Start Guide 
 
 ## Setup Check
 
@@ -18,9 +18,21 @@ This checks:
 
 ## Quick Run (Full Experiment)
 
+### Neuron Overlap Experiment 
+
 ```bash
 cd /workspace/CS2881-alignment-attribution-code
-bash scripts/run_full_experiment.sh
+bash scripts/run_full_experiment_1.sh
+```
+
+**Time**: 3-4 hours on A100
+**Output**: Results in `outputs/` directory
+
+### Neuron Drift Experiment
+
+```bash
+cd /workspace/CS2881-alignment-attribution-code
+bash scripts/run_full_experiment_2.sh
 ```
 
 **Time**: 6-12 hours on H100
@@ -28,7 +40,7 @@ bash scripts/run_full_experiment.sh
 
 ## Step-by-Step Run
 
-### Phase 1a: Compute SNIP Scores (~2-4 hours)
+### Phase 1a: Compute SNIP Scores (~0.5-1 hour)
 
 ```bash
 bash scripts/phase1_compute_snip_scores.sh
@@ -36,7 +48,7 @@ bash scripts/phase1_compute_snip_scores.sh
 
 Computes neuron importance scores on safety and utility datasets.
 
-### Phase 1b: Identify Neuron Groups (~5-10 minutes)
+### Phase 1b: Identify Neuron Groups (~10-20 minutes)
 
 ```bash
 bash scripts/phase1_identify_neurons.sh
@@ -44,15 +56,32 @@ bash scripts/phase1_identify_neurons.sh
 
 Extracts 4 neuron groups: safety (SNIP top), safety (set diff), utility, random.
 
-### Phase 2: Fine-Tune with Tracking (~4-8 hours)
+### Phase 2: Fine-Tune with Tracking (~1.5 hours)
 
 ```bash
 bash scripts/phase2_finetune.sh
 ```
 
-Fine-tunes with LoRA while tracking neuron weight drift.
+Fine-tunes with LoRA while freezing safety-critical neurons (exp 1) or tracking neuron weight drift (exp 2).
 
-### Phase 3: Analyze Results (~5-10 minutes)
+### Experiment 1: 
+
+#### Phase 3: Identify new neuron groups (10-20 minutes)
+```bash
+bash scripts/phase3_get_set_diff_for_finetuned_model.sh 
+```
+
+Get top safety, top utility and safety-critical neuron groups from finetuned model. 
+
+#### Phase 4: Evaluate results (10-20 minutes) 
+
+```bash 
+python eval_results.py 
+```
+
+### Experiment 2: 
+
+#### Phase 3: Analyze Results (~5-10 minutes)
 
 ```bash
 python analyze_drift.py
@@ -208,6 +237,4 @@ and Low-Rank Modifications." ICML 2024.
 
 ## Documentation
 
-- Full implementation guide: [docs/EXTENSION_IMPLEMENTATION.md](docs/EXTENSION_IMPLEMENTATION.md)
 - Original paper README: [README.md](README.md)
-- Extension concept: [docs/EXTENSION_DOC.md](docs/EXTENSION_DOC.md)

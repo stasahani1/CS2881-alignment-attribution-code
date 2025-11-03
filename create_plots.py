@@ -140,14 +140,6 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
                   linewidth=1.5,
                   alpha=0.8)
 
-        # Add text label
-        ax.annotate(method,
-                   (x, y),
-                   xytext=(5, 5),
-                   textcoords='offset points',
-                   fontsize=9,
-                   alpha=0.7)
-
     # Plot all set difference sparsity points (green triangles)
     for point in setdiff_data:
         x = point['zero_shot']
@@ -199,14 +191,6 @@ for idx, (metric_key, metric_label) in enumerate(asr_metrics):
                   edgecolors='black',
                   linewidth=2,
                   alpha=0.8)
-
-        # Add text label
-        ax.annotate(method,
-                   (x, y),
-                   xytext=(8, 8),
-                   textcoords='offset points',
-                   fontsize=11,
-                   alpha=0.7)
 
     # Plot all set difference sparsity points (green triangles)
     for point in setdiff_data:
